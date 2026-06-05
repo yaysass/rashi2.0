@@ -1,561 +1,501 @@
 """
 handlers/menu.py
 ================
-Главное меню + тематические разборы.
+Обработчики главного меню и тематических разборов.
 
-Архитектурные ограничения (из ТЗ):
-  - НЕТ длинных if/elif. Маршрутизация — через словарь _HANDLERS.
-  - Доступ проверяется ТОЛЬКО через core/access.py.
-  - Разборы читаются из core/catalog.py (READINGS).
-  - Все строки — из texts.TEXTS.
+Обрабатываемые callbacks:
+  menu:main       → перерисовать главное меню
+  natal:main      → разбор личности (из кэша, или на лету)
+  natal:code      → Натальный код (card_text без AI, мгновенно)
+  section:{key}   → проверка доступа → run_reading(key)
+  regen:{key}     → повторная генерация того же раздела
+  adv:menu        → подменю Продвинутого Джйотиша
 
-Точка входа для main.py:
-    from handlers.menu import setup_menu_handlers
-    setup_menu_handlers(application)
+Центральная функция run_reading() — единый диспетчер разборов.
+Никакого if/elif по ключам: логика доступа в core/access.py,
+метаданные в core/catalog.py, промпты в core/prompts.py.
+
+Порядок регистрации (важно!):
+  Хендлеры menu.py регистрируются ПОСЛЕДНИМИ. Специфические хендлеры
+  (premium.py → section:muhurta, section:weekly; questions.py → menu:question)
+  должны быть зарегистрированы раньше, чтобы перехватывать свои callbacks
+  до того, как до них доберётся catch-all «section:».
 """
 from __future__ import annotations
 
 import logging
-from typing import Callable, Coroutine
 
-from telegram import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest
-from telegram.ext import (
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from sqlalchemy import select
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import CallbackQueryHandler, ContextTypes
 
 from core.access import (
-    AccessResult,
-    check_and_grant,
-    check_regen_access,
-    is_section_locked,
+    can_open_premium,
+    can_open_theme,
+    charge_free_section,
+    record_paywall_shown,
 )
 from core.catalog import READINGS
 from core.prompts import build_user_prompt, get_system_prompt
-from db.crud import get_user
-from db.models import AsyncSession
+from db.models import AsyncSession, User
 from keyboards.keyboards import (
-    adv_jyotish_kb,
-    back_to_menu_kb,
-    houses_kb,
-    main_menu_kb,
-    natal_card_kb,
-    natal_code_kb,
-    paywall_kb,
-    questions_shop_kb,
-    reading_actions_kb,
-    settings_kb,
-    specials_kb,
+    advanced_menu,
+    back_to_menu,
+    main_menu,
+    natal_code_back,
+    paywall_keyboard,
+    premium_only_keyboard,
+    reading_actions,
 )
 from services.ai import generate
 from texts import TEXTS
 
 logger = logging.getLogger(__name__)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Мелкие хелперы
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def _safe_edit(
-    query: CallbackQuery,
-    text: str,
-    **kwargs,
-) -> None:
-    """Edit message in-place; gracefully handles Telegram errors."""
-    try:
-        await query.edit_message_text(text, **kwargs)
-    except BadRequest as e:
-        # "Message is not modified" — нормально при повторном нажатии
-        if "not modified" not in str(e).lower():
-            logger.warning("edit_message_text failed: %s", e)
-    except Exception as e:
-        logger.error("Unexpected error editing message: %s", e)
-
-
-async def _edit_by_id(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    message_id: int,
-    text: str,
-    **kwargs,
-) -> None:
-    """Edit after async gap (query might no longer be fresh)."""
-    try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            **kwargs,
-        )
-    except BadRequest as e:
-        if "not modified" not in str(e).lower():
-            # Если редактировать не удалось — отправляем новым сообщением
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=text,
-                    **{k: v for k, v in kwargs.items()
-                       if k in ("parse_mode", "reply_markup")},
-                )
-            except Exception as send_err:
-                logger.error("send_message fallback failed: %s", send_err)
-    except Exception as e:
-        logger.error("_edit_by_id failed: %s", e)
+# Эти ключи требуют multi-step flow и обрабатываются отдельными хендлерами.
+# section:{key} с этими ключами НЕ должны попадать в handle_section этого модуля.
+_DELEGATED_KEYS: frozenset[str] = frozenset({"muhurta", "weekly"})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Ядро: run_reading
+#  Вспомогательные функции
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _get_user(session, telegram_id: int) -> User | None:
+    result = await session.execute(
+        select(User).where(User.telegram_id == telegram_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _safe_edit(update: Update, text: str, **kwargs) -> None:
+    """
+    Редактирует текущее сообщение (callback) или шлёт новое (текстовый хендлер).
+    """
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, **kwargs)
+            return
+        except Exception:
+            pass
+    if update.effective_message:
+        await update.effective_message.reply_text(text, **kwargs)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Центральный диспетчер разборов
 # ──────────────────────────────────────────────────────────────────────────────
 
 async def run_reading(
-    section_key: str,
-    query: CallbackQuery,
+    update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    *,
-    is_regen: bool = False,
-    extra: dict | None = None,
+    key: str,
+    **extra,
 ) -> None:
     """
-    Единственная точка генерации разборов.
+    Единая точка генерации разбора для любого reading_key из READINGS.
 
     Алгоритм:
-      1. Читаем User из БД.
-      2. Проверяем ready-статус карты.
-      3. Для natalty (personality) без regen — возвращаем кэш.
-      4. Проверяем доступ через access.py (только при !is_regen).
-      5. Показываем loading-заглушку.
-      6. Генерируем через AI.
-      7. Обновляем кэш personality если нужно.
-      8. Отправляем результат с кнопками.
-    """
-    telegram_id = query.from_user.id
-    chat_id     = query.message.chat_id
-    message_id  = query.message.message_id
+    ┌── 1. Проверить entry в каталоге.
+    ├── 2. Загрузить пользователя и astro_json.
+    ├── 3. Проверить доступ (access.can_*).
+    │     └── Отказ → paywall / premium_only и выход.
+    ├── 4. Списать бесплатный клик (если нужно).
+    ├── 5. Показать loading-сообщение.
+    ├── 6. Собрать промпт через build_user_prompt.
+    ├── 7. Вызвать generate().
+    └── 8. Отредактировать loading → разбор + кнопки.
 
-    # ── 1. Читаем пользователя ───────────────────────────────────────────────
+    Параметры:
+      key    — ключ из READINGS (совпадает с prompt_key в _SECTION_INSTRUCTIONS)
+      **extra — параметры параметризованных промптов:
+                  weekly:  week="YYYY-Www"
+                  muhurta: event=str, period=str
+                  question: question=str
+    """
+    query = update.callback_query
+    if query:
+        await query.answer()
+
+    # ── 1. Каталог ────────────────────────────────────────────────────────
+    entry = READINGS.get(key)
+    if entry is None:
+        await _safe_edit(
+            update,
+            TEXTS["errors"]["reading_not_found"],
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     async with AsyncSession() as session:
-        user = await get_user(session, telegram_id)
+        # ── 2. Пользователь и кэш ────────────────────────────────────────
+        user = await _get_user(session, update.effective_user.id)
 
         if not user or not user.onboarding_complete:
-            await _safe_edit(query, TEXTS["errors"]["onboarding_required"])
+            await _safe_edit(
+                update,
+                TEXTS["errors"]["onboarding_required"],
+                parse_mode=ParseMode.HTML,
+            )
             return
 
         astro = user.get_astro()
-        if not astro or not astro.get("features"):
-            await _safe_edit(query, TEXTS["errors"]["calculation_pending"])
+        if not astro:
+            await _safe_edit(
+                update,
+                TEXTS["errors"]["calculation_pending"],
+                parse_mode=ParseMode.HTML,
+            )
             return
 
-        # ── 2. Кэш personality (только при первом открытии) ──────────────────
-        if section_key == "personality" and not is_regen:
-            cached_text = astro.get("personality")
-            if cached_text:
+        # ── 3. Проверка доступа ───────────────────────────────────────────
+        if entry.access == "freemium":
+            if not can_open_theme(user, key):
+                # Бесплатный клик уже потрачен на другую тему — пейволл
+                await record_paywall_shown(session, user)
                 await _safe_edit(
-                    query,
-                    cached_text,
-                    parse_mode="HTML",
-                    reply_markup=natal_card_kb(),
+                    update,
+                    TEXTS["paywall"]["locked_body"],
+                    reply_markup=paywall_keyboard(),
+                    parse_mode=ParseMode.HTML,
                 )
                 return
 
-        # ── 3. Проверка доступа ──────────────────────────────────────────────
-        if is_regen:
-            if not check_regen_access(user, section_key):
+        elif entry.access == "premium":
+            if not can_open_premium(user):
                 await _safe_edit(
-                    query,
-                    TEXTS["paywall"]["locked_body"],
-                    reply_markup=paywall_kb(),
-                )
-                return
-        else:
-            result = await check_and_grant(session, user, section_key)
-
-            if result == AccessResult.NOT_READY:
-                await _safe_edit(query, TEXTS["errors"]["calculation_pending"])
-                return
-            if result == AccessResult.PAYWALL_FREEMIUM:
-                # Записать время для брошенного-пейволл планировщика
-                from datetime import datetime
-                if not user.paywall_shown_at:
-                    user.paywall_shown_at = datetime.utcnow()
-                    await session.commit()
-                await _safe_edit(
-                    query,
-                    TEXTS["paywall"]["locked_body"],
-                    reply_markup=paywall_kb(),
-                )
-                return
-            if result == AccessResult.PAYWALL_PREMIUM:
-                await _safe_edit(
-                    query,
+                    update,
                     TEXTS["paywall"]["premium_only_body"],
-                    reply_markup=paywall_kb(premium_only=True),
+                    reply_markup=premium_only_keyboard(),
+                    parse_mode=ParseMode.HTML,
                 )
                 return
 
-        # Конфигурация раздела
-        config = READINGS.get(section_key)
-        if not config:
-            await _safe_edit(query, TEXTS["errors"]["reading_not_found"])
-            return
+        # entry.access == "free" — пропускаем без проверок
 
-        # Сохраняем всё нужное до закрытия сессии
-        user_name    = user.name or "друг"
-        user_gender  = user.gender or "unknown"
-        show_regen   = is_regen or check_regen_access(user, section_key)
+        # ── 4. Списать бесплатный клик (только для freemium, только первый раз) ──
+        if entry.access == "freemium":
+            charged = await charge_free_section(session, user, key)
+            if charged:
+                logger.info("Free click charged: user=%s key=%s", user.telegram_id, key)
 
-    # ── 4. Loading-заглушка ───────────────────────────────────────────────────
-    await _safe_edit(query, TEXTS["common"]["loading"])
+        # ── 5. Loading-сообщение ─────────────────────────────────────────
+        loading_msg = None
+        try:
+            if query:
+                loading_msg = await query.edit_message_text(
+                    TEXTS["common"]["loading"],
+                    parse_mode=ParseMode.HTML,
+                )
+            elif update.effective_message:
+                loading_msg = await update.effective_message.reply_text(
+                    TEXTS["common"]["loading"],
+                    parse_mode=ParseMode.HTML,
+                )
+        except Exception as e:
+            logger.debug("Could not send loading message: %s", e)
 
-    # ── 5. Генерация (может занять 5–15 с, сессия уже закрыта) ───────────────
-    try:
+        # ── 6. Сборка промпта ────────────────────────────────────────────
         prompt = build_user_prompt(
-            section_key, astro, user_name, user_gender,
-            **(extra or {}),
+            section_key=entry.prompt_key,   # совпадает с key во всех стандартных случаях
+            astro_json=astro,
+            user_name=user.name or "пользователь",
+            gender=user.gender or "unknown",
+            **extra,
         )
-        system = get_system_prompt(user_gender)
-        text = await generate(prompt, system=system, max_tokens=config.max_tokens)
-    except RuntimeError as exc:
-        logger.error("run_reading generate failed [%s]: %s", section_key, exc)
-        await _edit_by_id(
-            context, chat_id, message_id,
-            TEXTS["errors"]["generation_failed"],
-            reply_markup=back_to_menu_kb(),
-        )
-        return
+        system = get_system_prompt(user.gender or "unknown")
 
-    # ── 6. Кэшировать personality ─────────────────────────────────────────────
-    if section_key == "personality":
-        async with AsyncSession() as session:
-            user_upd = await get_user(session, telegram_id)
-            if user_upd:
-                astro_upd = user_upd.get_astro() or {}
-                astro_upd["personality"] = text
-                user_upd.set_astro(astro_upd)
-                await session.commit()
+        # ── 7. Генерация ─────────────────────────────────────────────────
+        result_text: str | None = None
+        try:
+            result_text = await generate(
+                prompt=prompt,
+                system=system,
+                max_tokens=entry.max_tokens,
+            )
+        except RuntimeError as exc:
+            logger.error("Generation failed for key=%s: %s", key, exc)
 
-    # ── 7. Отправить результат ────────────────────────────────────────────────
-    kb = (
-        natal_card_kb()
-        if section_key == "personality"
-        else reading_actions_kb(section_key, show_regen=show_regen)
-    )
+        # ── 8. Отправка результата ────────────────────────────────────────
+        # Перечитываем пользователя — charge_free_section мог изменить free_section_used.
+        # Сессия ещё открыта, объект user уже содержит актуальное состояние.
+        kb = reading_actions(key, user)
 
-    await _edit_by_id(
-        context, chat_id, message_id,
-        text,
-        parse_mode="HTML",
-        reply_markup=kb,
-    )
+        if not result_text:
+            display_text = TEXTS["errors"]["generation_failed"]
+        else:
+            display_text = result_text
+
+        if loading_msg:
+            try:
+                await loading_msg.edit_text(
+                    display_text,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                # Если edit не удался — шлём новым сообщением
+                if update.effective_message:
+                    await update.effective_message.reply_text(
+                        display_text,
+                        reply_markup=kb,
+                        parse_mode=ParseMode.HTML,
+                    )
+        else:
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    display_text,
+                    reply_markup=kb,
+                    parse_mode=ParseMode.HTML,
+                )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Атомарные обработчики (один callback-prefix = один обработчик)
+#  Callback-хендлеры
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def _handle_section(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Все разборы: section:love, section:navamsha, ..."""
-    section_key = query.data.split(":")[1]
-    await run_reading(section_key, query, context, is_regen=False)
-
-
-async def _handle_regen(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Перегенерация: regen:love, regen:personality, ..."""
-    section_key = query.data.split(":")[1]
-    await run_reading(section_key, query, context, is_regen=True)
-
-
-async def _handle_natal(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Натальная карта: natal:main (разбор личности) | natal:code (сырые данные)."""
-    sub = query.data.split(":")[1] if ":" in query.data else ""
-
-    if sub == "main":
-        await run_reading("personality", query, context, is_regen=False)
-        return
-
-    # natal:code — мгновенный вывод, без AI
-    telegram_id = query.from_user.id
-    async with AsyncSession() as session:
-        user = await get_user(session, telegram_id)
-
-    if not user:
-        await _safe_edit(query, TEXTS["errors"]["onboarding_required"])
-        return
-
-    astro = user.get_astro()
-    card_text = astro.get("card_text", "") if astro else ""
-
-    if not card_text:
-        await _safe_edit(query, TEXTS["errors"]["calculation_pending"])
-        return
-
-    header = TEXTS["natal"]["code_header"]
-    await _safe_edit(
-        query,
-        f"{header}\n\n{card_text}",
-        reply_markup=natal_code_kb(),
-    )
-
-
-async def _handle_house(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Разбор конкретного дома: house:1 .. house:12"""
-    try:
-        n = int(query.data.split(":")[1])
-    except (IndexError, ValueError):
-        await _safe_edit(query, TEXTS["errors"]["reading_not_found"])
-        return
-    await run_reading(f"house_{n}", query, context, is_regen=False, extra={"house_n": n})
-
-
-# ── Навигация по подменю ───────────────────────────────────────────────────────
-
-async def _show_main_menu(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    telegram_id = query.from_user.id
-    async with AsyncSession() as session:
-        user = await get_user(session, telegram_id)
-
-    if not user or not user.onboarding_complete:
-        await _safe_edit(query, TEXTS["errors"]["onboarding_required"])
-        return
-
-    await _safe_edit(
-        query,
-        TEXTS["menu"]["title"],
-        reply_markup=main_menu_kb(user),
-    )
-
-
-async def _show_premium(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    pt = TEXTS["premium"]
-    await _safe_edit(
-        query,
-        pt["body"],
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(pt["btn_buy"], callback_data="buy:premium_month")],
-            [InlineKeyboardButton(TEXTS["common"]["back_to_menu"], callback_data="menu:main")],
-        ]),
-    )
-
-
-async def _show_specials(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await _safe_edit(
-        query,
-        TEXTS["specials"]["body"],
-        parse_mode="HTML",
-        reply_markup=specials_kb(),
-    )
-
-
-async def _show_question(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Вопрос: показать баланс или магазин.
-    Сам поток ответа — в handlers/questions.py (Фаза 6).
-    """
-    from texts import pluralize
-    telegram_id = query.from_user.id
-
-    async with AsyncSession() as session:
-        from db.crud import get_or_replenish_questions
-        user = await get_user(session, telegram_id)
-        if not user:
-            await _safe_edit(query, TEXTS["errors"]["onboarding_required"])
-            return
-        balance = await get_or_replenish_questions(session, user)
-
-    if balance > 0:
-        word = pluralize(balance, TEXTS["shop"]["words_q"])
-        await _safe_edit(
-            query,
-            TEXTS["shop"]["balance_info"].format(n=balance, word=word),
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(
-                    TEXTS["shop"]["ask_question"].split("\n")[0],
-                    callback_data="question:ask",
-                )],
-                [InlineKeyboardButton(TEXTS["common"]["back_to_menu"], callback_data="menu:main")],
-            ]),
-        )
-    else:
-        await _safe_edit(
-            query,
-            TEXTS["shop"]["no_balance_body"],
-            reply_markup=questions_shop_kb(),
-        )
-
-
-async def _show_settings(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Настройки. Полная реализация — Фаза 8 (handlers/settings.py)."""
-    telegram_id = query.from_user.id
-    async with AsyncSession() as session:
-        user = await get_user(session, telegram_id)
-
-    if not user:
-        await _safe_edit(query, TEXTS["errors"]["onboarding_required"])
-        return
-
-    # Собираем краткий статус для отображения
-    from datetime import datetime
-    st = TEXTS["settings"]
-    if user.is_premium_active and user.premium_until:
-        status = st["sub_active"]
-        until  = user.premium_until.strftime("%d.%m.%Y")
-    else:
-        status = st["sub_inactive"]
-        until  = st["sub_no_date"]
-
-    sub_info = st["sub_body"].format(
-        status    = status,
-        until     = until,
-        questions = user.questions_balance or 0,
-    )
-
-    await _safe_edit(
-        query,
-        f"{st['title']}\n\n{sub_info}",
-        parse_mode="HTML",
-        reply_markup=settings_kb(),
-    )
-
-
-# Реестр навигационных sub-команд (menu:*)
-_NAV_HANDLERS: dict[str, Callable[..., Coroutine]] = {
-    "main":     _show_main_menu,
-    "premium":  _show_premium,
-    "specials": _show_specials,
-    "question": _show_question,
-    "settings": _show_settings,
-}
-
-
-async def _handle_nav(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Навигация: menu:main, menu:premium, menu:specials, ..."""
-    sub = query.data.split(":")[1] if ":" in query.data else ""
-    handler = _NAV_HANDLERS.get(sub)
-    if handler:
-        await handler(query, context)
-    else:
-        logger.warning("Unknown nav sub: %s", query.data)
-        await _safe_edit(query, TEXTS["errors"]["generic"])
-
-
-async def _handle_adv(query: CallbackQuery, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Продвинутый Джйотиш: adv:menu | adv:houses"""
-    sub = query.data.split(":")[1] if ":" in query.data else ""
-    telegram_id = query.from_user.id
-
-    async with AsyncSession() as session:
-        user = await get_user(session, telegram_id)
-
-    if not user:
-        await _safe_edit(query, TEXTS["errors"]["onboarding_required"])
-        return
-
-    if not user.is_premium_active:
-        await _safe_edit(
-            query,
-            TEXTS["paywall"]["premium_only_body"],
-            reply_markup=paywall_kb(premium_only=True),
-        )
-        return
-
-    if sub == "menu":
-        await _safe_edit(
-            query,
-            TEXTS["premium"]["adv_title"],
-            reply_markup=adv_jyotish_kb(),
-        )
-    elif sub == "houses":
-        await _safe_edit(
-            query,
-            TEXTS["premium"]["houses_title"],
-            reply_markup=houses_kb(),
-        )
-    else:
-        await _safe_edit(query, TEXTS["errors"]["generic"])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Главный диспетчер callback-ов (БЕЗ if/elif)
-# ──────────────────────────────────────────────────────────────────────────────
-
-#: Маршрутная таблица: prefix → handler
-#: Это и есть замена «гигантскому if/elif» из v1.
-_HANDLERS: dict[str, Callable[..., Coroutine]] = {
-    "section": _handle_section,
-    "natal":   _handle_natal,
-    "regen":   _handle_regen,
-    "menu":    _handle_nav,
-    "adv":     _handle_adv,
-    "house":   _handle_house,
-}
-
-
-async def dispatch_menu_callback(
+async def handle_menu_main(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Единственный обработчик для всех menu-related callbacks.
-    Маршрутизирует по первому сегменту callback_data до «:».
-
-    Регистрируется в main.py паттерном:
-        ^(section|natal|regen|menu|adv|house):
+    Перерисовать главное меню.
+    Callback: menu:main
     """
     query = update.callback_query
     await query.answer()
 
-    prefix = query.data.split(":")[0]
-    handler = _HANDLERS.get(prefix)
+    async with AsyncSession() as session:
+        user = await _get_user(session, update.effective_user.id)
+        if not user:
+            await query.edit_message_text(
+                TEXTS["errors"]["onboarding_required"],
+                parse_mode=ParseMode.HTML,
+            )
+            return
 
-    if handler:
-        await handler(query, context)
-    else:
-        logger.warning("dispatch_menu_callback: no handler for %r", query.data)
-        await _safe_edit(query, TEXTS["errors"]["generic"])
+        await query.edit_message_text(
+            TEXTS["menu"]["title"],
+            reply_markup=main_menu(user),
+            parse_mode=ParseMode.HTML,
+        )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Команда /menu
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/menu — показать главное меню."""
-    telegram_id = update.effective_user.id
+async def handle_natal_main(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Показать разбор личности (personality) из astro_json-кэша.
+    Если кэш пустой — сгенерировать на лету и сохранить.
+    Callback: natal:main
+    """
+    query = update.callback_query
+    await query.answer()
 
     async with AsyncSession() as session:
-        user = await get_user(session, telegram_id)
+        user = await _get_user(session, update.effective_user.id)
+        if not user:
+            return
 
-    if not user or not user.onboarding_complete:
-        await update.message.reply_text(
-            TEXTS["errors"]["onboarding_required"],
+        astro = user.get_astro()
+        if not astro:
+            await query.edit_message_text(
+                TEXTS["natal"]["no_data"],
+                reply_markup=back_to_menu(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        personality = astro.get("personality")
+
+        if not personality:
+            # Кэш пустой — генерируем на лету (старый пользователь без кэша)
+            await query.edit_message_text(
+                TEXTS["common"]["loading"],
+                parse_mode=ParseMode.HTML,
+            )
+            try:
+                prompt = build_user_prompt(
+                    section_key="personality",
+                    astro_json=astro,
+                    user_name=user.name or "пользователь",
+                    gender=user.gender or "unknown",
+                )
+                system = get_system_prompt(user.gender or "unknown")
+                personality = await generate(
+                    prompt=prompt,
+                    system=system,
+                    max_tokens=1600,
+                )
+                # Кэшируем
+                astro["personality"] = personality
+                user.set_astro(astro)
+                await session.commit()
+            except RuntimeError:
+                personality = TEXTS["errors"]["generation_failed"]
+
+        full_text = TEXTS["natal"]["header"] + "\n\n" + personality
+        kb = reading_actions("personality", user)
+
+        try:
+            await query.edit_message_text(
+                full_text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await update.effective_message.reply_text(
+                full_text,
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+
+
+async def handle_natal_code(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Показать Натальный код — сырые астрологические данные (card_text).
+    Мгновенно, без AI-генерации. Заголовки обычным регистром, пустые поля пропущены.
+    Callback: natal:code
+    """
+    query = update.callback_query
+    await query.answer()
+
+    async with AsyncSession() as session:
+        user = await _get_user(session, update.effective_user.id)
+        if not user:
+            return
+
+        astro = user.get_astro()
+        card_text = astro.get("card_text") if astro else None
+
+        if not card_text:
+            await query.edit_message_text(
+                TEXTS["natal"]["no_data"],
+                reply_markup=back_to_menu(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        full_text = TEXTS["natal"]["code_header"] + "\n\n" + card_text
+        try:
+            await query.edit_message_text(
+                full_text,
+                reply_markup=natal_code_back(),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            # Натальный код может быть длиннее лимита edit — шлём новым сообщением
+            await update.effective_message.reply_text(
+                full_text,
+                reply_markup=natal_code_back(),
+                parse_mode=ParseMode.HTML,
+            )
+
+
+async def handle_section(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Универсальный диспетчер для section:{key} callbacks.
+
+    Примечание: multi-step разборы (muhurta, weekly) регистрируются
+    в своих хендлерах (premium.py) РАНЬШЕ этого catch-all.
+    Если они всё равно попали сюда — логируем и игнорируем.
+    Callback: section:*
+    """
+    query = update.callback_query
+    key = query.data.split(":", 1)[1]
+
+    if key in _DELEGATED_KEYS:
+        logger.warning(
+            "section:%s reached menu catch-all handler (should be handled elsewhere)",
+            key,
         )
+        await query.answer()
         return
 
-    await update.message.reply_text(
-        TEXTS["menu"]["title"],
-        reply_markup=main_menu_kb(user),
+    await run_reading(update, context, key)
+
+
+async def handle_regen(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Перегенерация того же раздела.
+
+    Не тратит повторный бесплатный клик:
+      • charge_free_section() ничего не делает если free_section_used уже == key.
+      • can_open_theme() возвращает True для той же темы.
+
+    Callback: regen:{key}
+    """
+    query = update.callback_query
+    key = query.data.split(":", 1)[1]
+    await run_reading(update, context, key)
+
+
+async def handle_adv_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Показать подменю Продвинутого Джйотиша.
+    Требует активного премиума; иначе — premium_only paywall.
+    Callback: adv:menu
+    """
+    query = update.callback_query
+    await query.answer()
+
+    async with AsyncSession() as session:
+        user = await _get_user(session, update.effective_user.id)
+
+        if not user or not can_open_premium(user):
+            await query.edit_message_text(
+                TEXTS["paywall"]["premium_only_body"],
+                reply_markup=premium_only_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    # Заголовок подменю — используем label кнопки из главного меню
+    title = TEXTS["menu"]["btn_adv"]
+    await query.edit_message_text(
+        title,
+        reply_markup=advanced_menu(),
+        parse_mode=ParseMode.HTML,
     )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Регистрация хендлеров (вызывается из main.py)
+#  Регистрация хендлеров
 # ──────────────────────────────────────────────────────────────────────────────
 
-def setup_menu_handlers(app) -> None:
+def register(app) -> None:
     """
-    Регистрирует все menu-хендлеры в Application.
-    Вызов: setup_menu_handlers(application) из main.py.
+    Зарегистрировать все хендлеры этого модуля в Application.
+
+    ВАЖНО: вызывать ПОСЛЕ регистрации специфических хендлеров из:
+      - handlers/premium.py  (section:muhurta, section:weekly, adv:*)
+      - handlers/questions.py (menu:question)
+      - handlers/payments.py  (menu:premium)
+      - handlers/settings.py  (menu:settings)
+      - handlers/specials.py  (menu:specials)
+
+    Паттерн «section:» является catch-all и должен идти последним.
     """
-    # Одна точка для ВСЕХ menu-related callbacks
-    app.add_handler(
-        CallbackQueryHandler(
-            dispatch_menu_callback,
-            pattern=r"^(section|natal|regen|menu|adv|house):",
-        )
-    )
-    # /menu команда
-    app.add_handler(CommandHandler("menu", cmd_menu))
+    # Точные совпадения — регистрируем первыми внутри этого модуля
+    app.add_handler(CallbackQueryHandler(handle_menu_main,  pattern=r"^menu:main$"))
+    app.add_handler(CallbackQueryHandler(handle_natal_main, pattern=r"^natal:main$"))
+    app.add_handler(CallbackQueryHandler(handle_natal_code, pattern=r"^natal:code$"))
+    app.add_handler(CallbackQueryHandler(handle_adv_menu,   pattern=r"^adv:menu$"))
+
+    # Catch-all для section: и regen: — в конце
+    app.add_handler(CallbackQueryHandler(handle_regen,   pattern=r"^regen:"))
+    app.add_handler(CallbackQueryHandler(handle_section, pattern=r"^section:"))

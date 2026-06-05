@@ -1,151 +1,234 @@
 """
 core/catalog.py
 ===============
-Реестр всех разборов (READINGS).
-Один хендлер читает этот каталог вместо 30+ if/elif.
+Единый каталог всех разборов (reading catalog).
 
-access values:
-  "free"     — открыт всегда
-  "freemium" — 1 бесплатный клик, потом пейволл
-  "premium"  — только подписка
+Структура ReadingEntry:
+  title_key  — dot-path в TEXTS ("menu.btn_love") для заголовка/кнопки
+  access     — "free" | "freemium" | "premium"
+  prompt_key — ключ в prompts._SECTION_INSTRUCTIONS
+               Для стандартных разборов совпадает с ключом READINGS.
+               Для параметризованных (muhurta, weekly, question) — тот же ключ,
+               но хендлер обязан передать **extra с нужными params.
+  max_tokens — лимит токенов для Claude
+
+Почему prompt_key ≡ reading key:
+  build_user_prompt() использует section_key и для фильтрации тем (SECTION_AREAS),
+  и для поиска инструкции (_SECTION_INSTRUCTIONS). Оба словаря используют один
+  и тот же набор ключей, поэтому явное хранение prompt_key нужно только
+  для документирования и будущего расширения.
+
+Один хендлер run_reading() в handlers/menu.py закрывает все разборы.
+НИКАКОГО if/elif по ключам — только catalog[key] + access.can_*(user, key).
 """
 from __future__ import annotations
 
 from typing import NamedTuple
 
 
-class ReadingConfig(NamedTuple):
-    title_key:  str           # ключ в TEXTS для заголовка кнопки
-    access:     str           # "free" | "freemium" | "premium"
-    max_tokens: int = 1500    # лимит AI-ответа
+# ──────────────────────────────────────────────────────────────────────────────
+#  Запись каталога
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ReadingEntry(NamedTuple):
+    title_key:  str    # "section.btn_key" → TEXTS[section][btn_key]
+    access:     str    # "free" | "freemium" | "premium"
+    prompt_key: str    # key in prompts._SECTION_INSTRUCTIONS
+    max_tokens: int
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Главный реестр
+#  Каталог разборов
 # ──────────────────────────────────────────────────────────────────────────────
-READINGS: dict[str, ReadingConfig] = {
 
-    # ── Базовые (бесплатно) ───────────────────────────────────────────────────
-    "personality": ReadingConfig(
-        title_key  = "natal.header",
-        access     = "free",
-        max_tokens = 1600,
-    ),
+READINGS: dict[str, ReadingEntry] = {
 
-    # ── Freemium (1 бесплатный клик, потом подписка) ─────────────────────────
-    "love": ReadingConfig(
-        title_key  = "menu.btn_love",
-        access     = "freemium",
-    ),
-    "money": ReadingConfig(
-        title_key  = "menu.btn_money",
-        access     = "freemium",
-    ),
-    "karma": ReadingConfig(
-        title_key  = "menu.btn_karma",
-        access     = "freemium",
-    ),
-    "family": ReadingConfig(
-        title_key  = "menu.btn_family",
-        access     = "freemium",
-    ),
-    "years": ReadingConfig(
-        title_key  = "menu.btn_years",
-        access     = "freemium",
+    # ── Бесплатные ──────────────────────────────────────────────────────────
+    "personality": ReadingEntry(
+        title_key="menu.btn_natal",
+        access="free",
+        prompt_key="personality",
+        max_tokens=1600,
     ),
 
-    # ── Только подписка ───────────────────────────────────────────────────────
-    "weekly": ReadingConfig(
-        title_key  = "premium.weekly_title",
-        access     = "premium",
-        max_tokens = 900,
+    # ── Freemium: 1 бесплатный клик на любую тему ───────────────────────────
+    "love": ReadingEntry(
+        title_key="menu.btn_love",
+        access="freemium",
+        prompt_key="love",
+        max_tokens=1500,
     ),
-    "navamsha": ReadingConfig(
-        title_key  = "premium.btn_navamsha",
-        access     = "premium",
-        max_tokens = 1400,
+    "money": ReadingEntry(
+        title_key="menu.btn_money",
+        access="freemium",
+        prompt_key="money",    # _SECTION_INSTRUCTIONS["money"] — «Деньги и карьера»
+        max_tokens=1500,
     ),
-    "dashamsha": ReadingConfig(
-        title_key  = "premium.btn_dashamsha",
-        access     = "premium",
-        max_tokens = 1400,
+    "karma": ReadingEntry(
+        title_key="menu.btn_karma",
+        access="freemium",
+        prompt_key="karma",
+        max_tokens=1500,
     ),
-    "dasha_adv": ReadingConfig(
-        title_key  = "premium.btn_dasha",
-        access     = "premium",
-        max_tokens = 1400,
+    "family": ReadingEntry(
+        title_key="menu.btn_family",
+        access="freemium",
+        prompt_key="family",
+        max_tokens=1500,
     ),
-    "transits": ReadingConfig(
-        title_key  = "premium.btn_transits",
-        access     = "premium",
-        max_tokens = 1400,
+    "years": ReadingEntry(
+        title_key="menu.btn_years",
+        access="freemium",
+        prompt_key="years",    # _SECTION_INSTRUCTIONS["years"] — Дашa/важные годы
+        max_tokens=1500,
     ),
-    "nodes": ReadingConfig(
-        title_key  = "premium.btn_nodes",
-        access     = "premium",
-        max_tokens = 1400,
+
+    # ── Premium: Продвинутый Джйотиш ────────────────────────────────────────
+    "navamsha": ReadingEntry(
+        title_key="adv.btn_navamsha",
+        access="premium",
+        prompt_key="navamsha",
+        max_tokens=1400,
     ),
-    "atmakaraka": ReadingConfig(
-        title_key  = "premium.btn_atma",
-        access     = "premium",
-        max_tokens = 1400,
+    "dashamsha": ReadingEntry(
+        title_key="adv.btn_dashamsha",
+        access="premium",
+        prompt_key="dashamsha",
+        max_tokens=1400,
     ),
-    "yoga": ReadingConfig(
-        title_key  = "premium.btn_yoga",
-        access     = "premium",
-        max_tokens = 1400,
+    "dasha_adv": ReadingEntry(
+        title_key="adv.btn_dasha",
+        access="premium",
+        prompt_key="dasha_adv",
+        max_tokens=1400,
     ),
-    "shadbala": ReadingConfig(
-        title_key  = "premium.btn_shadbala",
-        access     = "premium",
-        max_tokens = 1400,
+    "transits": ReadingEntry(
+        title_key="adv.btn_transits",
+        access="premium",
+        prompt_key="transits",
+        max_tokens=1400,
     ),
-    "arudha": ReadingConfig(
-        title_key  = "premium.btn_arudha",
-        access     = "premium",
-        max_tokens = 1400,
+    "nodes": ReadingEntry(
+        title_key="adv.btn_nodes",
+        access="premium",
+        prompt_key="nodes",
+        max_tokens=1400,
     ),
-    "sadesati": ReadingConfig(
-        title_key  = "premium.btn_sadesati",
-        access     = "premium",
-        max_tokens = 1400,
+    "atmakaraka": ReadingEntry(
+        title_key="adv.btn_atma",
+        access="premium",
+        prompt_key="atmakaraka",
+        max_tokens=1400,
     ),
-    "upaya": ReadingConfig(
-        title_key  = "premium.btn_upaya",
-        access     = "premium",
-        max_tokens = 1400,
+    "yoga": ReadingEntry(
+        title_key="adv.btn_yoga",
+        access="premium",
+        prompt_key="yoga",
+        max_tokens=1400,
     ),
-    "muhurta": ReadingConfig(
-        title_key  = "premium.btn_muhurta",
-        access     = "premium",
-        max_tokens = 1200,
+    "shadbala": ReadingEntry(
+        title_key="adv.btn_shadbala",
+        access="premium",
+        prompt_key="shadbala",
+        max_tokens=1400,
     ),
-    # Houses 1..12 — параметризованный разбор (ключ динамический: "house_1".."house_12")
-    # Регистрируются в READINGS через цикл ниже
+    "arudha": ReadingEntry(
+        title_key="adv.btn_arudha",
+        access="premium",
+        prompt_key="arudha",
+        max_tokens=1400,
+    ),
+    "sadesati": ReadingEntry(
+        title_key="adv.btn_sadesati",
+        access="premium",
+        prompt_key="sadesati",
+        max_tokens=1400,
+    ),
+    "upaya": ReadingEntry(
+        title_key="adv.btn_upaya",
+        access="premium",
+        prompt_key="upaya",
+        max_tokens=1400,
+    ),
+
+    # ── Premium: параметризованные (хендлер передаёт **extra) ───────────────
+    # muhurta требует extra={"event": str, "period": str}
+    "muhurta": ReadingEntry(
+        title_key="adv.btn_muhurta",
+        access="premium",
+        prompt_key="muhurta",
+        max_tokens=1200,
+    ),
+
+    # weekly требует extra={"week": "YYYY-Www"}; обрабатывается в handlers/premium.py
+    "weekly": ReadingEntry(
+        title_key="menu.btn_weekly",
+        access="premium",
+        prompt_key="weekly",
+        max_tokens=900,
+    ),
 }
 
-# Добавляем 12 домов
-for _n in range(1, 13):
-    READINGS[f"house_{_n}"] = ReadingConfig(
-        title_key  = "premium.btn_houses",   # "Дом N" подставляется в клавиатуре
-        access     = "premium",
-        max_tokens = 1400,
-    )
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Производные множества — используются keyboards.py и handlers
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Все freemium-ключи — нужны для построения меню с замками
+FREEMIUM_KEYS: frozenset[str] = frozenset(
+    k for k, v in READINGS.items() if v.access == "freemium"
+)
+
+# Ключи Продвинутого Джйотиша (premium, кроме weekly)
+ADVANCED_KEYS: frozenset[str] = frozenset(
+    k for k, v in READINGS.items()
+    if v.access == "premium" and k != "weekly"
+)
+
+# Параметризованные разборы — требуют **extra, обрабатываются отдельными хендлерами
+PARAMETRIZED_KEYS: frozenset[str] = frozenset({"muhurta", "weekly"})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Сгруппированные ключи (используются в клавиатурах и планировщике)
+#  Хелпер резолюции title_key
 # ──────────────────────────────────────────────────────────────────────────────
 
-#: Freemium-разделы главного меню (в порядке показа)
-FREEMIUM_SECTIONS: list[str] = ["love", "money", "karma", "family", "years"]
+# Фоллбэки для кнопок Продвинутого Джйотиша на случай,
+# если секция "adv" ещё не добавлена в texts.py.
+_ADV_FALLBACKS: dict[str, str] = {
+    "btn_navamsha":  "🌙 Карта отношений (D9)",
+    "btn_dashamsha": "💼 Карта карьеры (D10)",
+    "btn_dasha":     "⏳ Периоды жизни",
+    "btn_transits":  "🪐 Транзиты планет",
+    "btn_nodes":     "🗝 Узлы судьбы",
+    "btn_atma":      "✨ Планета Души",
+    "btn_yoga":      "⚖️ Астрологические йоги",
+    "btn_shadbala":  "📊 Сила планет",
+    "btn_arudha":    "🪞 Образ в глазах других",
+    "btn_sadesati":  "🪐 Период Сатурна",
+    "btn_upaya":     "🌿 Упайи - рекомендации",
+    "btn_muhurta":   "🕯 Выбрать лучшее время",
+}
 
-#: Разделы «Продвинутого Джйотиша» (в порядке кнопок)
-PREMIUM_ADV_SECTIONS: list[str] = [
-    "navamsha", "dashamsha", "dasha_adv", "transits",
-    "nodes", "atmakaraka", "yoga", "shadbala",
-    "arudha", "sadesati", "upaya", "muhurta",
-]
 
-#: Ключи домов
-HOUSE_KEYS: list[str] = [f"house_{n}" for n in range(1, 13)]
+def resolve_title(entry: ReadingEntry, texts: dict) -> str:
+    """
+    Резолвит title_key ("section.btn_key") → строку из TEXTS с фоллбэком.
+
+    Пример: "menu.btn_love" → TEXTS["menu"]["btn_love"] → "🤍 Любовь и отношения"
+    """
+    parts = entry.title_key.split(".", 1)
+    if len(parts) != 2:
+        return entry.title_key
+
+    section, key = parts
+    section_dict = texts.get(section, {})
+
+    if isinstance(section_dict, dict) and key in section_dict:
+        return section_dict[key]
+
+    # Фоллбэк для adv.*
+    if section == "adv":
+        return _ADV_FALLBACKS.get(key, key)
+
+    return entry.title_key  # последний резерв — сам ключ

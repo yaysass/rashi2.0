@@ -1,75 +1,152 @@
 """
 keyboards/keyboards.py
 ======================
-Все inline-клавиатуры бота.
+Единственное место для сборки всех inline-клавиатур бота.
 
-Правила:
-  - Подписи только из texts.TEXTS — никаких строк в коде.
-  - Логика замков 🔒 только через core.access.is_section_locked.
-  - Все функции чистые: принимают данные, возвращают InlineKeyboardMarkup.
+Принципы:
+  • Все пользовательские строки — только из texts.py (через TEXTS).
+    Фоллбэки для ещё не заполненных ключей — в catalog.resolve_title().
+  • Кнопки НЕ скрываются при блокировке — добавляется замок 🔒
+    (визуальный маркер, клик ведёт на пейволл).
+  • Кнопка «Премиум-доступ» скрыта у активных подписчиков.
+  • Кнопка «Перегенерировать 🔄» показывается только при наличии доступа.
+  • Ни одного if/elif-каскада по ключам — всё через данные из catalog.py.
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from core.access import is_section_locked
-from db.models import User
+from core.access import can_open_premium, can_open_theme, freemium_lock_needed
+from core.catalog import READINGS, ReadingEntry, resolve_title
 from texts import TEXTS
 
+if TYPE_CHECKING:
+    from db.models import User
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Вспомогательный builder
+#  Внутренние хелперы
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _btn(label: str, cb: str, locked: bool = False) -> InlineKeyboardButton:
-    """Кнопка с опциональным замком 🔒 в конце подписи."""
-    suffix = TEXTS["menu"]["locked_suffix"] if locked else ""
-    return InlineKeyboardButton(label + suffix, callback_data=cb)
+def _btn(label: str, callback: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(label, callback_data=callback)
+
+
+def _lock(label: str) -> str:
+    """Добавляет суффикс 🔒 к тексту кнопки."""
+    return label + TEXTS["menu"]["locked_suffix"]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Главное меню
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main_menu_kb(user: User) -> InlineKeyboardMarkup:
+def main_menu(user: "User") -> InlineKeyboardMarkup:
     """
-    Клавиатура главного меню с актуальными замками для конкретного пользователя.
+    Динамическая клавиатура главного меню.
+
+    Логика замков (🔒):
+      - freemium-раздел: замок, если бесплатный клик потрачен на ДРУГУЮ тему
+        и пользователь не премиум.
+      - premium-раздел: замок, если нет активного премиума.
+
     Кнопка «Премиум-доступ» скрыта у активных подписчиков.
     """
-    t   = TEXTS["menu"]
-    pt  = TEXTS["premium"]
-    lok = is_section_locked  # сокращение
+    t    = TEXTS["menu"]
+    tc   = TEXTS["common"]
+    prem = user.is_premium_active
+
+    # ── Freemium: добавить замок если нужно ────────────────────────────────
+    def freemium_btn(key: str, text_key: str) -> InlineKeyboardButton:
+        label = t[text_key]
+        if freemium_lock_needed(user, key):
+            label = _lock(label)
+        return _btn(label, f"section:{key}")
+
+    # ── Premium-раздел: замок если нет подписки ────────────────────────────
+    def premium_btn(text_key: str, callback: str) -> InlineKeyboardButton:
+        label = t[text_key]
+        if not prem:
+            label = _lock(label)
+        return _btn(label, callback)
 
     rows = [
-        # ── Натальная карта (всегда бесплатно) ──────────────────────────────
-        [_btn(t["btn_natal"], "natal:main")],
+        # ── Натальная карта — всегда бесплатно ──────────────────────────────
+        [_btn(t["btn_natal"],     "natal:main")],
+        [_btn(t["btn_natal_code"],"natal:code")],
 
-        # ── Freemium (2 в ряд) ───────────────────────────────────────────────
+        # ── Freemium-темы: по 2 в ряд ───────────────────────────────────────
         [
-            _btn(t["btn_love"],  "section:love",  locked=lok(user, "love")),
-            _btn(t["btn_money"], "section:money", locked=lok(user, "money")),
+            freemium_btn("love",  "btn_love"),
+            freemium_btn("money", "btn_money"),
         ],
         [
-            _btn(t["btn_karma"],  "section:karma",  locked=lok(user, "karma")),
-            _btn(t["btn_family"], "section:family", locked=lok(user, "family")),
+            freemium_btn("karma",  "btn_karma"),
+            freemium_btn("family", "btn_family"),
         ],
-        [_btn(t["btn_years"], "section:years", locked=lok(user, "years"))],
+        # ── Важные годы — на всю ширину (длинная подпись) ───────────────────
+        [freemium_btn("years", "btn_years")],
 
-        # ── Только Premium ───────────────────────────────────────────────────
-        [_btn(pt["adv_title"], "adv:menu",       locked=lok(user, "navamsha"))],
-        [_btn(pt["weekly_title"], "section:weekly", locked=lok(user, "weekly"))],
+        # ── Premium-разделы ──────────────────────────────────────────────────
+        [premium_btn("btn_adv",    "adv:menu")],
+        [premium_btn("btn_weekly", "section:weekly")],
 
-        # ── Разовые покупки / всегда доступны ────────────────────────────────
+        # ── Особые разборы — всегда видны (оплата за каждый разбор) ─────────
         [_btn(t["btn_specials"], "menu:specials")],
+
+        # ── Вопросы и настройки ─────────────────────────────────────────────
         [_btn(t["btn_question"], "menu:question")],
+        [_btn(t["btn_settings"], "menu:settings")],
     ]
 
-    # Кнопка подписки скрыта у активных премиумов
-    if not user.is_premium_active:
+    # Кнопка «Премиум-доступ» скрыта у активных подписчиков
+    if not prem:
         rows.append([_btn(t["btn_premium"], "menu:premium")])
 
-    rows.append([_btn(t["btn_settings"], "menu:settings")])
+    return InlineKeyboardMarkup(rows)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Кнопки под готовым разбором
+# ──────────────────────────────────────────────────────────────────────────────
+
+def reading_actions(
+    reading_key: str,
+    user: "User",
+) -> InlineKeyboardMarkup:
+    """
+    Кнопки после сгенерированного разбора.
+
+    «Перегенерировать 🔄» — показывается только если у пользователя
+    есть право на повторный запрос (тот же раздел не тратит второй клик):
+      • free/premium разбор → всегда показывается.
+      • freemium → показывается если can_open_theme() вернёт True
+        (это True для своей темы и для премиума).
+
+    «В главное меню» — всегда.
+    """
+    tc    = TEXTS["common"]
+    entry = READINGS.get(reading_key)
+
+    rows: list[list[InlineKeyboardButton]] = []
+
+    # Определяем, показывать ли кнопку регенерации
+    can_regen = False
+    if entry is not None:
+        if entry.access == "free":
+            can_regen = True
+        elif entry.access == "freemium":
+            # can_open_theme учитывает: та же тема → True (повторный просмотр бесплатен)
+            can_regen = can_open_theme(user, reading_key)
+        elif entry.access == "premium":
+            can_regen = can_open_premium(user)
+
+    if can_regen:
+        rows.append([_btn(tc["regenerate"], f"regen:{reading_key}")])
+
+    rows.append([_btn(tc["back_to_menu"], "menu:main")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -77,171 +154,94 @@ def main_menu_kb(user: User) -> InlineKeyboardMarkup:
 #  Пейволл
 # ──────────────────────────────────────────────────────────────────────────────
 
-def paywall_kb(premium_only: bool = False) -> InlineKeyboardMarkup:
+def paywall_keyboard() -> InlineKeyboardMarkup:
     """
-    Кнопки под сообщением пейволла.
-    premium_only=True — раздел только для подписки (без фразы «1 клик потрачен»).
+    Пейволл для freemium-разделов.
+    Показывается когда бесплатный клик уже потрачен на другую тему.
     """
-    pw = TEXTS["paywall"]
-    cm = TEXTS["common"]
+    t_pw = TEXTS["paywall"]
+    tc   = TEXTS["common"]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(pw["cta_btn"],         callback_data="menu:premium")],
-        [InlineKeyboardButton(cm["back_to_menu"],    callback_data="menu:main")],
+        [_btn(t_pw["cta_btn"],    "menu:premium")],
+        [_btn(tc["back_to_menu"], "menu:main")],
+    ])
+
+
+def premium_only_keyboard() -> InlineKeyboardMarkup:
+    """
+    Пейволл для premium-разделов (Продвинутый Джйотиш, Фокус недели).
+    """
+    t_pw = TEXTS["paywall"]
+    tc   = TEXTS["common"]
+    return InlineKeyboardMarkup([
+        [_btn(t_pw["cta_btn"],    "menu:premium")],
+        [_btn(tc["back_to_menu"], "menu:main")],
     ])
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Действия под разбором (Перегенерировать + Назад)
+#  Продвинутый Джйотиш — подменю
 # ──────────────────────────────────────────────────────────────────────────────
 
-def reading_actions_kb(section_key: str, *, show_regen: bool = True) -> InlineKeyboardMarkup:
+# Порядок кнопок и их раскладка (пары — по 2 в ряд).
+# Длинные заголовки — на всю ширину (пустой второй элемент → одиночная кнопка).
+_ADV_LAYOUT: list[tuple[str, str] | tuple[str, str, str, str]] = [
+    ("navamsha",  "dashamsha"),   # 2 в ряд
+    ("dasha_adv", "transits"),    # 2 в ряд
+    ("nodes",     "atmakaraka"),  # 2 в ряд
+    ("yoga",      "shadbala"),    # 2 в ряд
+    ("arudha",    "sadesati"),    # 2 в ряд
+    ("upaya",),                   # на всю ширину
+    ("muhurta",),                 # на всю ширину
+]
+
+
+def advanced_menu() -> InlineKeyboardMarkup:
     """
-    Кнопки под каждым сгенерированным разбором.
-    show_regen=False — не показывать перегенерацию (когда доступ уже исчерпан).
+    Подменю «Продвинутый Джйотиш».
+
+    Кнопки строятся из catalog.READINGS: заголовки берутся через
+    resolve_title() с фоллбэком, поэтому не нужен «adv»-раздел в texts.py.
+    Если секция будет добавлена — автоматически подтянутся правильные строки.
     """
-    cm = TEXTS["common"]
-    row_back = [InlineKeyboardButton(cm["back_to_menu"], callback_data="menu:main")]
-
-    if not show_regen:
-        return InlineKeyboardMarkup([row_back])
-
-    row_regen = [
-        InlineKeyboardButton(cm["regenerate"], callback_data=f"regen:{section_key}")
-    ]
-    return InlineKeyboardMarkup([row_regen, row_back])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Натальная карта
-# ──────────────────────────────────────────────────────────────────────────────
-
-def natal_card_kb() -> InlineKeyboardMarkup:
-    """Кнопки под натальной картой (personal reading)."""
-    t  = TEXTS["menu"]
-    cm = TEXTS["common"]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(t["btn_natal_code"], callback_data="natal:code")],
-        [InlineKeyboardButton(cm["regenerate"],    callback_data="regen:personality")],
-        [InlineKeyboardButton(cm["back_to_menu"],  callback_data="menu:main")],
-    ])
-
-
-def natal_code_kb() -> InlineKeyboardMarkup:
-    """Кнопки под натальным кодом (raw data, без AI)."""
-    cm = TEXTS["common"]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(cm["back_to_menu"], callback_data="menu:main")],
-    ])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Продвинутый Джйотиш
-# ──────────────────────────────────────────────────────────────────────────────
-
-def adv_jyotish_kb() -> InlineKeyboardMarkup:
-    """Подменю «Продвинутый Джйотиш» (13 инструментов + дома + назад)."""
-    p  = TEXTS["premium"]
-    cm = TEXTS["common"]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(p["btn_houses"],    callback_data="adv:houses")],
-        [
-            InlineKeyboardButton(p["btn_navamsha"],  callback_data="section:navamsha"),
-            InlineKeyboardButton(p["btn_dasha"],     callback_data="section:dasha_adv"),
-        ],
-        [
-            InlineKeyboardButton(p["btn_nodes"],     callback_data="section:nodes"),
-            InlineKeyboardButton(p["btn_atma"],      callback_data="section:atmakaraka"),
-        ],
-        [
-            InlineKeyboardButton(p["btn_yoga"],      callback_data="section:yoga"),
-            InlineKeyboardButton(p["btn_shadbala"],  callback_data="section:shadbala"),
-        ],
-        [
-            InlineKeyboardButton(p["btn_dashamsha"], callback_data="section:dashamsha"),
-            InlineKeyboardButton(p["btn_arudha"],    callback_data="section:arudha"),
-        ],
-        [
-            InlineKeyboardButton(p["btn_sadesati"],  callback_data="section:sadesati"),
-            InlineKeyboardButton(p["btn_transits"],  callback_data="section:transits"),
-        ],
-        [
-            InlineKeyboardButton(p["btn_muhurta"],   callback_data="section:muhurta"),
-            InlineKeyboardButton(p["btn_upaya"],     callback_data="section:upaya"),
-        ],
-        [InlineKeyboardButton(cm["back_to_menu"],    callback_data="menu:main")],
-    ])
-
-
-def houses_kb() -> InlineKeyboardMarkup:
-    """Подменю «Разбор 12 домов»."""
-    p  = TEXTS["premium"]
-    cm = TEXTS["common"]
+    tc   = TEXTS["common"]
     rows = []
-    # По 3 кнопки в ряд: 1-2-3, 4-5-6, 7-8-9, 10-11-12
-    for start in range(1, 13, 3):
-        row = [
-            InlineKeyboardButton(
-                p["btn_house"].format(n=n),
-                callback_data=f"house:{n}",
-            )
-            for n in range(start, min(start + 3, 13))
-        ]
-        rows.append(row)
-    rows.append([InlineKeyboardButton(cm["back"], callback_data="adv:menu")])
+
+    for group in _ADV_LAYOUT:
+        if len(group) == 2:
+            k1, k2 = group
+            e1 = READINGS.get(k1)
+            e2 = READINGS.get(k2)
+            row = []
+            if e1:
+                row.append(_btn(resolve_title(e1, TEXTS), f"section:{k1}"))
+            if e2:
+                row.append(_btn(resolve_title(e2, TEXTS), f"section:{k2}"))
+            if row:
+                rows.append(row)
+        else:
+            k1 = group[0]
+            e1 = READINGS.get(k1)
+            if e1:
+                rows.append([_btn(resolve_title(e1, TEXTS), f"section:{k1}")])
+
+    rows.append([_btn(tc["back_to_menu"], "menu:main")])
     return InlineKeyboardMarkup(rows)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Особые разборы
+#  Прочие клавиатуры
 # ──────────────────────────────────────────────────────────────────────────────
 
-def specials_kb() -> InlineKeyboardMarkup:
-    s  = TEXTS["specials"]
-    cm = TEXTS["common"]
+def back_to_menu() -> InlineKeyboardMarkup:
+    """Одна кнопка «В главное меню» — используется для простых экранов."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(s["btn_synastry"], callback_data="special:synastry")],
-        [InlineKeyboardButton(s["btn_child"],    callback_data="special:child")],
-        [InlineKeyboardButton(s["btn_year"],     callback_data="special:year")],
-        [InlineKeyboardButton(cm["back_to_menu"], callback_data="menu:main")],
+        [_btn(TEXTS["common"]["back_to_menu"], "menu:main")]
     ])
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Магазин вопросов
-# ──────────────────────────────────────────────────────────────────────────────
-
-def questions_shop_kb() -> InlineKeyboardMarkup:
-    s  = TEXTS["shop"]
-    cm = TEXTS["common"]
+def natal_code_back() -> InlineKeyboardMarkup:
+    """После Натального кода — только кнопка «Назад»."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(s["btn_q1"],  callback_data="buy:q1")],
-        [InlineKeyboardButton(s["btn_q3"],  callback_data="buy:q3")],
-        [InlineKeyboardButton(s["btn_q10"], callback_data="buy:q10")],
-        [InlineKeyboardButton(cm["back_to_menu"], callback_data="menu:main")],
+        [_btn(TEXTS["common"]["back_to_menu"], "menu:main")]
     ])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Настройки
-# ──────────────────────────────────────────────────────────────────────────────
-
-def settings_kb() -> InlineKeyboardMarkup:
-    s  = TEXTS["settings"]
-    cm = TEXTS["common"]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(s["btn_edit_birth"],    callback_data="settings:edit_birth")],
-        [InlineKeyboardButton(s["btn_weekly_time"],   callback_data="settings:weekly_time")],
-        [InlineKeyboardButton(s["btn_notifications"], callback_data="settings:notifications")],
-        [InlineKeyboardButton(s["btn_subscription"],  callback_data="settings:subscription")],
-        [InlineKeyboardButton(cm["back_to_menu"],     callback_data="menu:main")],
-    ])
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Универсальная кнопка «Назад в меню»
-# ──────────────────────────────────────────────────────────────────────────────
-
-def back_to_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton(TEXTS["common"]["back_to_menu"], callback_data="menu:main")
-    ]])

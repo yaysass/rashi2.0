@@ -1,174 +1,151 @@
 """
 core/access.py
 ==============
-Единственное место проверки прав.
+Единый модуль проверки и расходования прав доступа.
 
-Все разделы и хендлеры обращаются только сюда.
-Никакой дублирующей логики в handlers/.
+Три уровня доступа:
+  free     — всегда открыто (personality / natal)
+  freemium — 1 бесплатный клик на ЛЮБУЮ тему; та же тема — всегда; иначе — paywall
+  premium  — требует активной подписки
 
-Главный контракт:
-  check_and_grant(session, user, key) → AccessResult
-    - Если FREEMIUM и бесплатный клик не потрачен → записывает key в
-      user.free_section_used, делает commit, возвращает GRANTED.
-    - Не вызывай его дважды для одной сессии — commit уже случился.
+Принцип разделения обязанностей:
+  • can_*()      — синхронные предикаты, НЕ меняют БД, вызываются в hot-path.
+  • charge_*()   — async-мутации, вызываются ТОЛЬКО когда can_*() уже вернул True.
+  • record_*()   — async-логирование событий (paywall, etc.).
 
-  is_section_locked(user, key) → bool
-    - Чистая функция, без IO. Для рисования 🔒 в клавиатурах.
-
-  check_regen_access(user, key) → bool
-    - Чистая функция. Перегенерация не тратит клик.
+Все мутации принимают AsyncSession снаружи: handlers несут ответственность
+за commit/rollback-контекст.
 """
 from __future__ import annotations
 
-from enum import Enum, auto
+import logging
+from datetime import datetime
+from typing import TYPE_CHECKING
 
-from db.models import AsyncSession, User
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+    from db.models import User
 
-
-class AccessResult(Enum):
-    GRANTED          = auto()  # можно читать
-    PAYWALL_FREEMIUM = auto()  # бесплатный клик потрачен, нужна подписка
-    PAYWALL_PREMIUM  = auto()  # раздел только для подписки
-    NOT_READY        = auto()  # онбординг не завершён или карта ещё считается
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  Проверка с побочным эффектом (DB write)
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def check_and_grant(
-    session: AsyncSession,
-    user: User,
-    section_key: str,
-) -> AccessResult:
-    """
-    Проверяет доступ к разделу и при необходимости тратит бесплатный клик.
-
-    Побочный эффект: если бесплатный клик тратится — делает commit.
-    Вызывается только при открытии раздела (не при перегенерации).
-    """
-    # Ленивый импорт, чтобы не было циклов
-    from core.catalog import READINGS
-
-    if not user.onboarding_complete:
-        return AccessResult.NOT_READY
-
-    config = READINGS.get(section_key)
-    if not config:
-        return AccessResult.GRANTED  # неизвестный ключ = разрешить
-
-    access = config.access
-
-    # ── Всегда бесплатно ──────────────────────────────────────────────────────
-    if access == "free":
-        return AccessResult.GRANTED
-
-    # ── Freemium ──────────────────────────────────────────────────────────────
-    if access == "freemium":
-        if user.is_premium_active:
-            return AccessResult.GRANTED
-
-        # Тот же раздел, что открывали бесплатно → всегда разрешить
-        if user.free_section_used == section_key:
-            return AccessResult.GRANTED
-
-        # Бесплатный клик ещё не потрачен → тратим
-        if user.free_section_used is None:
-            user.free_section_used = section_key
-            await session.commit()
-            return AccessResult.GRANTED
-
-        # Клик потрачен на другой раздел
-        return AccessResult.PAYWALL_FREEMIUM
-
-    # ── Только подписка ───────────────────────────────────────────────────────
-    if access == "premium":
-        return (
-            AccessResult.GRANTED
-            if user.is_premium_active
-            else AccessResult.PAYWALL_PREMIUM
-        )
-
-    return AccessResult.GRANTED
+logger = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Чистые функции (без IO) — для клавиатур и regen
+#  Предикаты доступа (синхронные, без обращения к БД)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def is_section_locked(user: User, section_key: str) -> bool:
+def can_open_theme(user: "User", key: str) -> bool:
     """
-    Нужно ли рисовать 🔒 на кнопке?
+    Проверяет право на открытие freemium-раздела.
 
-    Логика совпадает с check_and_grant, но без побочных эффектов.
+    Возвращает True если хотя бы одно из:
+      1. Активный Премиум.
+      2. Эта же тема уже открыта бесплатно ранее (повторный просмотр — бесплатно).
+      3. Бесплатный клик ещё не потрачен (первое открытие любой темы).
     """
-    from core.catalog import READINGS
-
-    config = READINGS.get(section_key)
-    if not config:
-        return False
-
-    if config.access == "free":
-        return False
-
     if user.is_premium_active:
-        return False
-
-    if config.access == "freemium":
-        # Не заблокировано, если:
-        #   а) клик ещё не потрачен (любой раздел откроется бесплатно)
-        #   б) клик потрачен именно на этот раздел
-        if user.free_section_used is None:
-            return False
-        return user.free_section_used != section_key
-
-    if config.access == "premium":
-        return True  # для не-премиума всегда заблокировано
-
+        return True
+    if user.free_section_used == key:
+        # та же тема — всегда разрешено, включая перегенерацию
+        return True
+    if user.free_section_used is None:
+        # бесплатный клик ещё не потрачен
+        return True
     return False
 
 
-def check_regen_access(user: User, section_key: str) -> bool:
-    """
-    Можно ли перегенерировать разбор?
-
-    Перегенерация не тратит клик, но требует того же уровня доступа.
-    """
-    from core.catalog import READINGS
-
-    config = READINGS.get(section_key)
-    if not config:
-        return False
-
-    if config.access == "free":
-        return True
-
-    if user.is_premium_active:
-        return True
-
-    if config.access == "freemium":
-        # Можно перегенерировать только тот раздел, на который потрачен клик
-        return user.free_section_used == section_key
-
-    # access == "premium" и user не premium → нельзя
-    return False
+def can_open_premium(user: "User") -> bool:
+    """Требует активную подписку (freemium тут не проходит)."""
+    return user.is_premium_active
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Вопросы
-# ──────────────────────────────────────────────────────────────────────────────
-
-def has_questions(user: User) -> bool:
-    """У пользователя есть платные/бонусные вопросы."""
+def has_questions(user: "User") -> bool:
+    """Есть ли вопросы в балансе (>0)."""
     return (user.questions_balance or 0) > 0
 
 
-async def spend_question(session: AsyncSession, user: User) -> bool:
+def freemium_lock_needed(user: "User", key: str) -> bool:
     """
-    Списать 1 вопрос. Возвращает True если успешно, False если баланс 0.
+    Нужно ли рисовать замок 🔒 на кнопке freemium-раздела.
+
+    Используется keyboards.py при построении главного меню.
     """
-    if (user.questions_balance or 0) <= 0:
+    if user.is_premium_active:
         return False
-    user.questions_balance -= 1
+    # Замок показываем только если бесплатный клик уже потрачен
+    # и потрачен на ДРУГУЮ тему (эта остаётся открытой).
+    return user.free_section_used is not None and user.free_section_used != key
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Мутации доступа
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def charge_free_section(
+    session: "AsyncSession",
+    user: "User",
+    key: str,
+) -> bool:
+    """
+    Помечает раздел как использованный бесплатный клик.
+
+    Вызывать только когда can_open_theme() вернул True.
+    Ничего не делает, если:
+      - пользователь уже премиум (клик не нужен)
+      - этот раздел уже отмечен как использованный
+      - клик уже потрачен на другую тему (тогда can_open_theme() вернул бы False)
+
+    Возвращает True, если клик был фактически списан.
+    """
+    if user.is_premium_active:
+        return False
+    if user.free_section_used is not None:
+        return False  # уже использован ранее
+
+    user.free_section_used = key
     await session.commit()
+    logger.info(
+        "User %s spent free click on '%s'",
+        user.telegram_id, key,
+    )
     return True
+
+
+async def deduct_question(
+    session: "AsyncSession",
+    user: "User",
+) -> int:
+    """
+    Списывает 1 вопрос из баланса.
+
+    Вызывать только после проверки has_questions().
+    Возвращает остаток после списания.
+    """
+    before = user.questions_balance or 0
+    user.questions_balance = max(0, before - 1)
+    await session.commit()
+    logger.info(
+        "User %s: question deducted (%d → %d)",
+        user.telegram_id, before, user.questions_balance,
+    )
+    return user.questions_balance
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Логирование событий
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def record_paywall_shown(
+    session: "AsyncSession",
+    user: "User",
+) -> None:
+    """
+    Фиксирует момент показа пейволла.
+
+    Используется планировщиком для отправки paywall-ремайндера
+    через PAYWALL_REMINDER_AFTER_DAYS дней.
+    Не перезаписывает уже существующую дату (первый показ важнее).
+    """
+    if user.paywall_shown_at is None:
+        user.paywall_shown_at = datetime.utcnow()
+        await session.commit()
+        logger.debug("User %s: paywall_shown_at recorded", user.telegram_id)
