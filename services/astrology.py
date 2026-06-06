@@ -267,7 +267,7 @@ async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
     tasks = [
         va(Calculate.AllPlanetData,    birth_time_obj),  # [verify]
         va(Calculate.PlanetSthanaBala,   birth_time_obj),  # [verify]
-        va(Calculate.PlanetAvastha,    birth_time_obj),  # [verify]
+        va(Calculate.PlanetAvasta,    birth_time_obj),  # [verify]
         va(Calculate.PlanetAspects,    birth_time_obj),  # [verify]
         va(Calculate.NavamshaChart,    birth_time_obj),  # [verify]
         va(Calculate.DashamnshaChart,  birth_time_obj),  # [verify]
