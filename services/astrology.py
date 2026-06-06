@@ -41,6 +41,93 @@ except ImportError:
 except Exception as exc:
     logger.warning("VedAstro init error: %s", exc)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Method-name resolver
+#  VedAstro Python API differs between versions. Instead of hard-coding one
+#  name per metric, we try a list of candidates and cache the first match.
+#  Any metric whose method can't be resolved gracefully returns None.
+# ──────────────────────────────────────────────────────────────────────────────
+_METHOD_CANDIDATES: dict[str, list[str]] = {
+    "all_planets":  ["AllPlanetData", "AllPlanetsData", "AllPlanets",
+                     "PlanetData", "AllPlanetDataList"],
+    "shadbala":     ["PlanetSthanaBala", "PlanetShadbalaTotal", "PlanetShadbala",
+                     "PlanetTotalShadbalaInRupa", "PlanetSthanaBalaChart"],
+    "avastha":      ["PlanetAvasta", "PlanetAvastha", "PlanetBalaAvastha",
+                     "PlanetJagradadiAvastha", "PlanetAvasthaName"],
+    "aspects":      ["PlanetsInAspect", "PlanetAspects", "PlanetAspectsList",
+                     "AllPlanetAspects", "PlanetAspectedBy"],
+    "navamsha":     ["NavamshaChart", "NavamsaChart", "NavamsaD9Chart",
+                     "NavamsaSignAllPlanets", "AllPlanetD9Sign"],
+    "dashamsha":    ["DashamshaChart", "DasamsaChart", "DashamnshaChart",
+                     "D10Chart", "DashamamshaChart", "AllPlanetD10Sign"],
+    "dasha":        ["VimshottariDasha", "VimshottariDasa", "DasaAtBirth",
+                     "CurrentDasaAtBirth", "CurrentDasaForPerson"],
+    "yogas":        ["Yoga", "AllYogas", "YogasChart", "AllYogasInChart",
+                     "YogaList", "YogaTable"],
+    "sade_sati":    ["SadeSati", "IsSadeSati", "SadeSatiSummary",
+                     "SadeSatiStatus", "SadeSatiSummaryReport"],
+}
+
+_RESOLVED_METHODS: dict[str, Any] = {}
+
+
+def _resolve_method(key: str) -> Any | None:
+    """
+    Return the first Calculate.* method whose name appears in the candidate list
+    for `key`. Cached on first call. Returns None if nothing matches.
+    """
+    if key in _RESOLVED_METHODS:
+        return _RESOLVED_METHODS[key]
+    if Calculate is None:
+        _RESOLVED_METHODS[key] = None
+        return None
+    candidates = _METHOD_CANDIDATES.get(key, [])
+    for name in candidates:
+        fn = getattr(Calculate, name, None)
+        if callable(fn):
+            _RESOLVED_METHODS[key] = fn
+            logger.info("VedAstro: %s → Calculate.%s", key, name)
+            return fn
+    _RESOLVED_METHODS[key] = None
+    logger.warning(
+        "VedAstro: %s НЕ найдено (пробовал: %s)",
+        key, ", ".join(candidates),
+    )
+    return None
+
+
+def _list_available_methods(prefix_filter: str = "") -> list[str]:
+    """Names of all public callables on Calculate (optionally filtered by prefix)."""
+    if Calculate is None:
+        return []
+    out: list[str] = []
+    for name in dir(Calculate):
+        if name.startswith("_"):
+            continue
+        if prefix_filter and not name.startswith(prefix_filter):
+            continue
+        if callable(getattr(Calculate, name, None)):
+            out.append(name)
+    return sorted(out)
+
+
+def _log_resolver_diagnostics() -> None:
+    """At first chart build, log: (a) which methods resolved, (b) what's actually available."""
+    for key in _METRIC_KEYS:
+        _resolve_method(key)  # populates cache, logs each
+    # Snapshot of all Planet/Chart/Yoga methods for debugging unresolved ones
+    sample = _list_available_methods()
+    relevant = [n for n in sample if any(
+        kw in n for kw in ("Planet", "Chart", "Yoga", "Dasa", "Dasha", "Avast",
+                           "Sade", "Aspect", "Navams", "Dasham", "All", "House"))]
+    logger.info(
+        "VedAstro: установленная версия предоставляет %d публичных методов; "
+        "релевантных: %d. Список: %s",
+        len(sample), len(relevant), ", ".join(relevant) if relevant else "(none)",
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  Static lookup tables
 # ──────────────────────────────────────────────────────────────────────────────
@@ -258,34 +345,39 @@ _METRIC_KEYS = [
 
 async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
     """
-    Fire all VedAstro calls in parallel.
-    Each call runs in its own thread (VedAstro is blocking I/O).
-    return_exceptions=True ensures one failure never kills the rest.
-
-    [Phase 1] Verify every method name via Calculate.ListAPICalls().
+    Fire all VedAstro calls in parallel. Methods that don't exist in the installed
+    version simply return None — they don't take down the rest of the chart.
     """
-    tasks = [
-        va(Calculate.AllPlanetData,    birth_time_obj),  # [verify]
-        va(Calculate.PlanetSthanaBala,   birth_time_obj),  # [verify]
-        va(Calculate.PlanetAvasta,    birth_time_obj),  # [verify]
-        va(Calculate.PlanetAspects,    birth_time_obj),  # [verify]
-        va(Calculate.NavamshaChart,    birth_time_obj),  # [verify]
-        va(Calculate.DashamnshaChart,  birth_time_obj),  # [verify]
-        va(Calculate.VimshottariDasha, birth_time_obj),  # [verify]
-        va(Calculate.Yoga,             birth_time_obj),  # [verify]
-        va(Calculate.SadeSati,         birth_time_obj),  # [verify]
-    ]
+    if not _VA_AVAILABLE:
+        return {key: None for key in _METRIC_KEYS}
 
-    raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+    # One-time diagnostic at first build: which methods resolved, what's available
+    if not _RESOLVED_METHODS:
+        _log_resolver_diagnostics()
+
+    async def _safe_call(key: str) -> Any:
+        fn = _resolve_method(key)
+        if fn is None:
+            return None
+        try:
+            return await va(fn, birth_time_obj)
+        except Exception as exc:
+            logger.warning("VedAstro %s (%s) failed: %s",
+                           key, getattr(fn, "__name__", "?"), exc)
+            return None
+
+    raw_results = await asyncio.gather(
+        *[_safe_call(key) for key in _METRIC_KEYS],
+        return_exceptions=True,
+    )
 
     result: dict[str, Any] = {}
     for key, value in zip(_METRIC_KEYS, raw_results):
         if isinstance(value, BaseException):
-            logger.warning("VedAstro call %r failed: %s", key, value)
+            logger.warning("VedAstro call %r unexpected error: %s", key, value)
             result[key] = None
         else:
             result[key] = value
-
     return result
 
 
