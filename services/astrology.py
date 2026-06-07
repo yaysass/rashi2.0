@@ -480,6 +480,22 @@ async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
                   for n in ["Sun", "Moon", "Mars", "Rahu", "Ketu"]}
         logger.info("[ENUM] PlanetName sample: %s", sample)
 
+    # ── Локальная функция-обёртка для произвольного вызова с обработкой ошибок ──
+    async def _safe(fn, *args, default=None):
+        if fn is None or any(a is None for a in args):
+            return default
+        try:
+            return await va(fn, *args)
+        except Exception as exc:
+            logger.debug("Call %s%r failed: %s",
+                         getattr(fn, "__name__", "?"), args, exc)
+            return default
+
+    # ── PlanetName-enum словарь (для aspects, которые требуют per-planet) ────
+    planet_enums: dict[str, Any] = {}
+    for name in PLANET_NAMES_EN:
+        planet_enums[name] = getattr(PlanetName, name, None) if PlanetName else None
+
     # ── Вспомогательная функция для bulk-вызовов (один аргумент time) ────────
     async def _chart_call(method_name: str) -> Any:
         fn = getattr(Calculate, method_name, None)
@@ -492,133 +508,138 @@ async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
             logger.warning("VedAstro %s failed: %s", method_name, exc)
             return None
 
-    # ── Сбор bulk-данных (параллельно — разные методы не мешают друг другу) ──
-    (lon_raw, sign_raw, house_raw, nak_raw,
-     d9_raw, d10_raw, str_raw, data_raw) = await asyncio.gather(
-        _chart_call("AllPlanetLongitude"),
-        _chart_call("AllPlanetRasiSigns"),
-        _chart_call("AllPlanetHouseData"),
-        _chart_call("AllPlanetConstellation"),
-        _chart_call("AllPlanetNavamshaSign"),
-        _chart_call("AllPlanetDashamamshaSign"),
-        _chart_call("AllPlanetStrength"),
-        _chart_call("AllPlanetData"),           # дополнительный источник
-    )
-
-    # Диагностика: показать атрибуты первого элемента из каждого bulk-результата
-    def _dump_first(raw, label: str) -> None:
-        for item in _iter_safe(raw):
-            attrs = {a: str(getattr(item, a, ""))[:30]
-                     for a in dir(item)
-                     if not a.startswith("_") and not callable(getattr(item, a, None))}
-            logger.info("[%s] first item attrs: %s", label, attrs)
-            break
-
-    _dump_first(lon_raw,  "LON")
-    _dump_first(sign_raw, "SIGN")
-    _dump_first(data_raw, "DATA")
-
-    # ── Парсим bulk-данные в словари {name_en: value} ──────────────────────
-    def _extract_planet_map(raw: Any,
-                            *val_attrs: str,
-                            coerce=_to_str) -> dict[str, Any]:
-        """Iterate bulk result → {planet_en: first-non-None value from val_attrs}"""
+    # ── Coerce vedastro bulk-result в Python-словарь {planet_name: value} ─────
+    def _coerce_planet_dict(raw: Any, label: str = "") -> dict[str, Any]:
+        """
+        Превратить vedastro bulk-результат в обычный Python dict {planet_en: value}.
+        Vedastro возвращает C# Dictionary<PlanetName, T> — нужно правильно
+        вытащить пары key-value.
+        """
+        if raw is None:
+            return {}
         out: dict[str, Any] = {}
-        for item in _iter_safe(raw):
-            name_en = _planet_name_from(item)
-            if name_en not in PLANET_NAMES_EN:
-                continue
-            for attr in val_attrs:
-                v = getattr(item, attr, None)
-                if v is not None:
-                    out[name_en] = coerce(v)
-                    break
+
+        # Стратегия 1: уже Python dict
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                name_en = _planet_name_from(k) or _to_str(k)
+                if name_en in PLANET_NAMES_EN:
+                    out[name_en] = v
+            if out:
+                if label:
+                    logger.info("[%s] parsed as Python dict: %d items", label, len(out))
+                return out
+
+        # Стратегия 2: .items() (C# Dictionary, Mapping)
+        if hasattr(raw, "items"):
+            try:
+                for k, v in raw.items():
+                    name_en = _planet_name_from(k) or _to_str(k)
+                    if name_en in PLANET_NAMES_EN:
+                        out[name_en] = v
+                if out:
+                    if label:
+                        logger.info("[%s] parsed via .items(): %d items", label, len(out))
+                    return out
+            except Exception as exc:
+                logger.debug("[%s] .items() failed: %s", label, exc)
+
+        # Стратегия 3: KeyValuePair-подобные объекты
+        try:
+            for item in raw:
+                k = getattr(item, "Key", None) or getattr(item, "key", None)
+                v = getattr(item, "Value", None) or getattr(item, "value", None)
+                if k is not None:
+                    name_en = _planet_name_from(k) or _to_str(k)
+                    if name_en in PLANET_NAMES_EN:
+                        out[name_en] = v
+            if out:
+                if label:
+                    logger.info("[%s] parsed as KeyValuePairs: %d items", label, len(out))
+                return out
+        except Exception as exc:
+            logger.debug("[%s] KeyValuePair iter failed: %s", label, exc)
+
+        # Стратегия 4: возможно raw — это subscriptable dict через ключи
+        try:
+            for key in raw:
+                name_en = _planet_name_from(key) or _to_str(key)
+                if name_en not in PLANET_NAMES_EN:
+                    continue
+                try:
+                    out[name_en] = raw[key]
+                except Exception:
+                    out[name_en] = None
+            if out:
+                if label:
+                    logger.info("[%s] parsed via subscript: %d items", label, len(out))
+                return out
+        except Exception:
+            pass
+
+        if label:
+            logger.warning("[%s] failed to parse — type=%s", label, type(raw).__name__)
         return out
 
-    # Долготы: пробуем разные поля объекта
-    lons = _extract_planet_map(
-        lon_raw, "TotalDegrees", "Longitude", "Value", "Degrees", "NirayanaLongitude",
-        coerce=_to_float,
-    )
-    # Знаки: из AllPlanetRasiSigns
-    signs = _extract_planet_map(
-        sign_raw, "Sign", "ZodiacSign", "RasiSign", "PlanetSign",
-        coerce=_parse_sign,
-    )
-    # Дома: из AllPlanetHouseData
-    houses = _extract_planet_map(
-        house_raw, "HouseNumber", "House", "HouseNum",
-        coerce=_to_int,
-    )
-    # Накшатры
-    naks = _extract_planet_map(
-        nak_raw, "Nakshatra", "ConstellationName", "Name",
-        coerce=_to_str,
-    )
-    # D9, D10
-    d9s = _extract_planet_map(
-        d9_raw, "Sign", "NavamshaSign", "ZodiacSign",
-        coerce=_parse_sign,
-    )
-    d10s = _extract_planet_map(
-        d10_raw, "Sign", "DashamshaSign", "ZodiacSign",
-        coerce=_parse_sign,
-    )
-    # Сила планет
-    strs = _extract_planet_map(
-        str_raw, "Value", "Strength", "TotalStrength",
-        coerce=_to_float,
+    # ── Сбор bulk-данных (параллельно — разные методы не мешают друг другу) ──
+    (lon_raw, sign_raw, nak_raw,
+     d9_raw, str_raw) = await asyncio.gather(
+        _chart_call("AllPlanetLongitude"),
+        _chart_call("AllPlanetRasiSigns"),
+        _chart_call("AllPlanetConstellation"),
+        _chart_call("AllPlanetNavamshaSign"),
+        _chart_call("AllPlanetStrength"),
     )
 
-    # Fallback из AllPlanetData — перебираем атрибуты которые там могут быть
-    data_lons: dict[str, float] = {}
-    data_signs: dict[str, str] = {}
-    data_retro: dict[str, bool] = {}
-    for item in _iter_safe(data_raw):
-        name_en = _planet_name_from(item)
-        if name_en not in PLANET_NAMES_EN:
-            continue
-        # Longitude
-        for attr in ("Longitude", "NirayanaLongitude", "TotalDegrees", "LongitudeDegrees"):
-            v = getattr(item, attr, None)
-            if v is not None:
-                data_lons[name_en] = _to_float(v)
-                break
-        # Sign
-        for attr in ("Sign", "PlanetSign", "ZodiacSign", "RasiSign"):
-            v = getattr(item, attr, None)
-            if v is not None:
-                s = _parse_sign(v)
-                if s:
-                    data_signs[name_en] = s
-                    break
-        # Retro
-        for attr in ("IsRetrograde", "PlanetIsRetrograde", "Retrograde"):
-            v = getattr(item, attr, None)
-            if v is not None:
-                data_retro[name_en] = bool(v)
-                break
+    # ── Парсим bulk-данные в словари {planet_en: value} ──────────────────────
+    lons_dict   = _coerce_planet_dict(lon_raw,   "LON")
+    signs_dict  = _coerce_planet_dict(sign_raw,  "SIGN")
+    naks_dict   = _coerce_planet_dict(nak_raw,   "NAK")
+    d9s_dict    = _coerce_planet_dict(d9_raw,    "D9")
+    strs_dict   = _coerce_planet_dict(str_raw,   "STR")
+
+    # Преобразуем значения к нужным типам
+    lons  = {k: _to_float(v) for k, v in lons_dict.items() if v is not None}
+    signs = {k: _parse_sign(v) for k, v in signs_dict.items() if v is not None}
+    naks  = {k: _to_str(v) for k, v in naks_dict.items() if v is not None}
+    d9s   = {k: _parse_sign(v) for k, v in d9s_dict.items() if v is not None}
+    strs  = {k: _to_float(v) for k, v in strs_dict.items() if v is not None}
+
+    # ── Дома планет: вычислим математически от Лагны (whole-sign) ────────────
+    # (Lagna будет вычислена ниже, сначала собираем планеты с house=0)
+    houses: dict[str, int] = {}
+
+    # ── Retrograde: per-planet (sequential, на single-thread executor) ───────
+    fn_retro = getattr(Calculate, "IsPlanetRetrograde", None)
+    retros: dict[str, bool] = {}
+    if fn_retro:
+        for name_en in PLANET_NAMES_EN:
+            enum = planet_enums.get(name_en)
+            if enum is None:
+                continue
+            try:
+                r = await va(fn_retro, enum, birth_time_obj)
+                retros[name_en] = bool(r)
+            except Exception:
+                pass
 
     # ── Собираем финальный словарь планет ───────────────────────────────────
     planets: dict[str, dict] = {}
     for name_en in PLANET_NAMES_EN:
-        # Долгота: приоритет bulk_lon → data_lon
-        lon = lons.get(name_en) or data_lons.get(name_en)
-        # Знак: приоритет bulk_sign → data_sign → математически из долготы
-        sign_ru = (signs.get(name_en) or data_signs.get(name_en)
-                   or _sign_from_longitude_ru(lon))
-        # Ретро: из AllPlanetData или None (не показываем если нет данных)
-        retro = data_retro.get(name_en)
+        lon = lons.get(name_en)
+        sign_ru = signs.get(name_en) or _sign_from_longitude_ru(lon)
+        retro = retros.get(name_en, False)
+        # Sun и Moon никогда не бывают ретроградными — защита от глюка vedastro
+        if name_en in ("Sun", "Moon"):
+            retro = False
+        # Раху и Кету всегда ретроградные
+        if name_en in ("Rahu", "Ketu"):
+            retro = True
 
         degree = round(lon % 30, 2) if lon is not None else 0.0
         nakshatra = naks.get(name_en, "")
-        house = houses.get(name_en, 0)
-
-        # D9 / D10
         d9 = d9s.get(name_en) or _navamsha_from_longitude_ru(lon)
-        d10 = d10s.get(name_en) or _d10_from_longitude_ru(lon)
-
-        # Дигнити — вычисляем из знака + планеты (честная аппроксимация)
+        d10 = _d10_from_longitude_ru(lon)
         dignity = _compute_dignity_from_sign(name_en, sign_ru)
 
         planets[name_en] = {
@@ -626,7 +647,7 @@ async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
             "degree":        degree,
             "nakshatra":     nakshatra,
             "pada":          0,
-            "retro":         retro if retro is not None else False,
+            "retro":         retro,
             "combust":       False,
             "vargottama":    False,
             "dignity":       dignity,
@@ -636,14 +657,13 @@ async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
             "avastha":       "",
             "shadbala":      strs.get(name_en),
             "lon_full":      lon,
-            "house":         house,
+            "house":         0,
         }
         logger.info(
-            "[LON] %-8s lon=%-8s sign=%-12s house=%-2s retro=%s",
+            "[LON] %-8s lon=%-8s sign=%-12s retro=%s",
             name_en,
             f"{lon:.2f}" if lon is not None else "None",
             sign_ru or "(empty)",
-            house or "?",
             retro,
         )
 
