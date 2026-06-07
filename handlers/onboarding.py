@@ -133,6 +133,22 @@ async def _get_user(session, telegram_id: int) -> User | None:
 # ──────────────────────────────────────────────────────────────────────────────
 #  Фоновый расчёт карты
 # ──────────────────────────────────────────────────────────────────────────────
+async def _keep_typing(bot: Bot, chat_id: int, stop_event: asyncio.Event) -> None:
+    """
+    Удерживает индикатор «печатает...» в чате до тех пор, пока stop_event не set.
+    Telegram держит индикатор ~5 секунд, поэтому шлём его каждые 4 секунды.
+    """
+    while not stop_event.is_set():
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=4.0)
+        except asyncio.TimeoutError:
+            continue
+
+
 async def _compute_chart(
     telegram_id: int,
     birth_date: str,
@@ -146,19 +162,29 @@ async def _compute_chart(
     bot: Bot,
 ) -> None:
     """
-    Тяжёлый фоновый таск.  Запускается через asyncio.create_task() — не блокирует
-    ConversationHandler.
+    Фоновый таск. Запускается из confirm_city_yes через asyncio.create_task.
 
-    Порядок:
-      1. Параллельный сбор всех метрик VedAstro (asyncio.gather внутри)
-      2. Feature Extractor → темы + central_conflict
-      3. Форматирование Натального кода
-      4. AI-генерация базового разбора личности
-      5. Сохранение astro_json в БД + onboarding_complete=True
-      6. Отправка разбора пользователю
+    Логика:
+      1. Шлёт ОДНО сообщение прогресса и запускает непрерывный typing-индикатор.
+      2. Считает карту через VedAstro, прогоняет FeatureExtractor, генерит AI-разбор.
+      3. На успехе отправляет разбор и главное меню.
+      4. На неудаче — НЕ показывает системную плашку. Просто шлёт главное меню.
     """
+    stop_typing = asyncio.Event()
+    typing_task: asyncio.Task | None = None
     try:
-        # ── 1. VedAstro ─────────────────────────────────────────────────────
+        # ── 1. Единое сообщение прогресса + начинаем typing ─────────────────
+        progress_text = TEXTS.get("onboarding", {}).get(
+            "computing",
+            "Считаю твою карту 🪐\nЭто займёт около минуты — карта строится по-настоящему.",
+        )
+        try:
+            await bot.send_message(chat_id=telegram_id, text=progress_text)
+        except Exception:
+            pass
+        typing_task = asyncio.create_task(_keep_typing(bot, telegram_id, stop_typing))
+
+        # ── 2. VedAstro ─────────────────────────────────────────────────────
         astro = await build_astro_data(
             birth_date=birth_date,
             birth_time_str=birth_time,
@@ -168,21 +194,21 @@ async def _compute_chart(
             city_name=city,
         )
 
-        # ── 2. Feature Extractor ─────────────────────────────────────────────
+        # ── 3. Feature Extractor ────────────────────────────────────────────
         chart = {"raw": astro["raw"], "metrics": astro["metrics"]}
         features = FeatureExtractor().extract(chart)
         astro["features"] = features
 
-        # ── 3. Натальный код (без AI) ────────────────────────────────────────
+        # ── 4. Натальный код (без AI) ───────────────────────────────────────
         astro["card_text"] = format_natal_code(astro)
 
-        # ── 4. Разбор личности (AI) ──────────────────────────────────────────
+        # ── 5. Разбор личности (AI) ─────────────────────────────────────────
         prompt = build_user_prompt("personality", astro, name, gender)
         system = get_system_prompt(gender)
-        personality = await generate(prompt, system=system, max_tokens=1600)
+        personality = await generate(prompt, system=system, max_tokens=2400)
         astro["personality"] = personality
 
-        # ── 5. Сохранение в БД ───────────────────────────────────────────────
+        # ── 6. Сохранение в БД ──────────────────────────────────────────────
         async with AsyncSession() as session:
             user = await _get_user(session, telegram_id)
             if user:
@@ -197,36 +223,54 @@ async def _compute_chart(
                 )
                 return
 
-        # ── 6. Отправка разбора ─────────────────────────────────────────────
-        header = TEXTS["onboarding"]["success_header"].format(name=name)
+        # ── 7. Стопим typing ПЕРЕД отправкой разбора ────────────────────────
+        stop_typing.set()
+        if typing_task:
+            try:
+                await asyncio.wait_for(typing_task, timeout=1.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+
+        # ── 8. Отправка разбора ─────────────────────────────────────────────
+        header = TEXTS["onboarding"].get("success_header", "").format(name=name) \
+            if "success_header" in TEXTS.get("onboarding", {}) else ""
+        body = f"{header}\n{personality}" if header else personality
         await bot.send_message(
             chat_id=telegram_id,
-            text=f"{header}\n{personality}",
+            text=body,
             parse_mode="HTML",
         )
 
-    except RuntimeError as exc:
-        # AI или VedAstro упали
-        logger.error("_compute_chart failed for %d: %s", telegram_id, exc)
+        # ── 9. Главное меню ─────────────────────────────────────────────────
         try:
             await bot.send_message(
                 chat_id=telegram_id,
-                text=TEXTS["onboarding"]["calc_error"],
+                text=TEXTS["menu"]["title"],
+                reply_markup=_main_menu_keyboard(),
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to send main menu after chart: %s", exc)
+
     except Exception as exc:
         logger.error(
             "_compute_chart unexpected error for %d: %s",
             telegram_id, exc, exc_info=True,
         )
+        # Не показываем системную плашку. Просто шлём главное меню — пользователь
+        # может попробовать перезайти или связаться с поддержкой через другие пункты.
+        stop_typing.set()
         try:
             await bot.send_message(
                 chat_id=telegram_id,
-                text=TEXTS["onboarding"]["calc_error"],
+                text=TEXTS["menu"]["title"],
+                reply_markup=_main_menu_keyboard(),
             )
         except Exception:
             pass
+    finally:
+        stop_typing.set()
+        if typing_task and not typing_task.done():
+            typing_task.cancel()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -476,29 +520,15 @@ async def confirm_city_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         name=f"chart_{user_tg.id}",
     )
 
-    # ── Drama-сообщения (пока таск считает VedAstro) ─────────────────────────
-    await query.edit_message_text(TEXTS["onboarding"]["drama_1"])
-
-    await asyncio.sleep(3)
-
-    await context.bot.send_message(
-        chat_id=user_tg.id,
-        text=TEXTS["onboarding"]["drama_2"],
-    )
-
-    await asyncio.sleep(4)
-
-    await context.bot.send_message(
-        chat_id=user_tg.id,
-        text=TEXTS["onboarding"]["drama_3"],
-    )
-
-    # ── Главное меню ─────────────────────────────────────────────────────────
-    await context.bot.send_message(
-        chat_id=user_tg.id,
-        text=TEXTS["menu"]["title"],
-        reply_markup=_main_menu_keyboard(),
-    )
+    # ── Подтверждение города. Прогресс-сообщение, typing и главное меню ──────
+    # ── приходят из _compute_chart, когда разбор готов. ──────────────────────
+    try:
+        await query.edit_message_text(
+            TEXTS.get("onboarding", {}).get("city_confirmed",
+                "Принято. Сейчас построю твою карту 🪐"),
+        )
+    except Exception:
+        pass
 
     # Очищаем временные данные онбординга
     context.user_data.pop("ob", None)
