@@ -787,7 +787,14 @@ def build_user_prompt(
     gender_ru = "мужской" if gender == "male" else "женский"
 
     anchors_lines = "\n".join(f"  {k}: {v}" for k, v in anchors.items() if v)
-    anchors_block = anchors_lines or "  (данные карты ещё загружаются)"
+
+    # Защита: если данных карты нет — НЕ зовём Claude вообще. Иначе он напишет
+    # placeholder вида «данные загружаются» вместо реального разбора.
+    if not anchors_lines.strip():
+        raise RuntimeError(
+            f"empty_chart_anchors: cannot generate '{section_key}' without astro data"
+        )
+    anchors_block = anchors_lines
 
     themes_lines = "\n".join(
         f"  - {t['tag']}  [вес: {t['weight']}]"
