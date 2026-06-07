@@ -32,7 +32,7 @@ _VA_AVAILABLE = False
 Calculate = GeoLocation = Time = None  # type: ignore[assignment]
 
 try:
-    from vedastro import Calculate, GeoLocation, Time  # type: ignore[no-redef]
+    from vedastro import Calculate, GeoLocation, Time, PlanetName, HouseName  # type: ignore[no-redef]
     _VA_AVAILABLE = True
     Calculate.SetAPIKey(VEDASTRO_API_KEY)
     logger.info("VedAstro initialised OK")
@@ -40,6 +40,56 @@ except ImportError:
     logger.warning("vedastro not installed — astrology features disabled")
 except Exception as exc:
     logger.warning("VedAstro init error: %s", exc)
+
+
+# Знаки в фиксированном порядке для перевода долготы → знак (0=Овен, 11=Рыбы)
+ZODIAC_INDEX_EN: list[str] = [
+    "Aries", "Taurus", "Gemini", "Cancer", "Leo", "Virgo",
+    "Libra", "Scorpio", "Sagittarius", "Capricorn", "Aquarius", "Pisces",
+]
+
+
+def _sign_from_longitude_ru(lon: float | None) -> str:
+    """Перевести нираяна-долготу (0-360°) в русское имя знака."""
+    if lon is None:
+        return ""
+    sign_en = ZODIAC_INDEX_EN[int(lon // 30) % 12]
+    return ZODIAC_EN_TO_RU.get(sign_en, sign_en)
+
+
+def _navamsha_from_longitude_ru(lon: float | None) -> str:
+    """D9-знак по формуле (lon*9) % 360."""
+    if lon is None:
+        return ""
+    nav_lon = (lon * 9) % 360
+    sign_en = ZODIAC_INDEX_EN[int(nav_lon // 30) % 12]
+    return ZODIAC_EN_TO_RU.get(sign_en, sign_en)
+
+
+def _d10_from_longitude_ru(lon: float | None) -> str:
+    """D10-знак по Парашаре (нечётные знаки от себя, чётные от 9-го)."""
+    if lon is None:
+        return ""
+    sign_idx = int(lon // 30) % 12
+    part = int((lon % 30) // 3)  # 0..9
+    is_odd = (sign_idx % 2 == 0)
+    start = sign_idx if is_odd else (sign_idx + 8) % 12
+    sign_en = ZODIAC_INDEX_EN[(start + part) % 12]
+    return ZODIAC_EN_TO_RU.get(sign_en, sign_en)
+
+
+def _house_from_lagna(planet_sign_ru: str, lagna_sign_ru: str) -> int:
+    """Whole-sign house: какой по счёту дом от Лагны занимает данный знак."""
+    SIGNS_RU = [
+        "Овен", "Телец", "Близнецы", "Рак", "Лев", "Дева",
+        "Весы", "Скорпион", "Стрелец", "Козерог", "Водолей", "Рыбы",
+    ]
+    try:
+        p_idx = SIGNS_RU.index(planet_sign_ru)
+        l_idx = SIGNS_RU.index(lagna_sign_ru)
+    except ValueError:
+        return 0
+    return ((p_idx - l_idx) % 12) + 1
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -345,40 +395,224 @@ _METRIC_KEYS = [
 
 async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
     """
-    Fire all VedAstro calls in parallel. Methods that don't exist in the installed
-    version simply return None — they don't take down the rest of the chart.
+    Per-planet collection через правильные сигнатуры VedAstro.
+
+    Возвращает уже-распарсенные структуры (не сырые объекты), поэтому функции
+    parse_planets/parse_lagna и т.п. больше НЕ применяются — build_astro_data
+    использует результат напрямую.
     """
     if not _VA_AVAILABLE:
-        return {key: None for key in _METRIC_KEYS}
+        return {
+            "planets": {}, "lagna": {"sign": "", "degree": 0.0, "nakshatra": ""},
+            "navamsha": {}, "dasha": {"maha": "", "antar": "", "until": ""},
+            "shadbala": {}, "avastha": {}, "aspects": [], "yogas": [], "sade_sati": "",
+        }
 
-    # One-time diagnostic at first build: which methods resolved, what's available
+    # Одноразовая диагностика
     if not _RESOLVED_METHODS:
         _log_resolver_diagnostics()
 
-    async def _safe_call(key: str) -> Any:
-        fn = _resolve_method(key)
-        if fn is None:
-            return None
+    # Резолвим per-planet методы один раз
+    fn_lon       = getattr(Calculate, "PlanetNirayanaLongitude", None)
+    fn_retro     = getattr(Calculate, "IsPlanetRetrograde", None)
+    fn_nak       = getattr(Calculate, "PlanetConstellation", None)
+    fn_exalt     = getattr(Calculate, "IsPlanetExalted", None)
+    fn_debil     = getattr(Calculate, "IsPlanetDebilitated", None)
+    fn_own       = getattr(Calculate, "IsPlanetInOwnSign", None)
+    fn_friend    = getattr(Calculate, "IsPlanetInFriendSign", None)
+    fn_enemy     = getattr(Calculate, "IsPlanetInEnemySign", None)
+    fn_combust   = getattr(Calculate, "IsPlanetCombust", None)
+    fn_vargot    = getattr(Calculate, "IsPlanetVargottama", None)
+    fn_d9        = getattr(Calculate, "PlanetNavamshaD9Sign", None)
+    fn_d10       = getattr(Calculate, "PlanetDashamamshaD10Sign", None)
+    fn_avastha   = getattr(Calculate, "PlanetAvasta", None)
+    fn_shadbala  = getattr(Calculate, "PlanetSthanaBala", None)
+    fn_strength  = getattr(Calculate, "PlanetStrength", None)
+
+    # Per-planet enum
+    planet_enums: dict[str, Any] = {}
+    for name in PLANET_NAMES_EN:
+        planet_enums[name] = getattr(PlanetName, name, None) if PlanetName else None
+
+    async def _safe(fn, *args, default=None):
+        if fn is None or any(a is None for a in args):
+            return default
         try:
-            return await va(fn, birth_time_obj)
+            return await va(fn, *args)
         except Exception as exc:
-            logger.warning("VedAstro %s (%s) failed: %s",
-                           key, getattr(fn, "__name__", "?"), exc)
-            return None
+            logger.debug("Call %s%r failed: %s", getattr(fn, "__name__", "?"), args, exc)
+            return default
 
-    raw_results = await asyncio.gather(
-        *[_safe_call(key) for key in _METRIC_KEYS],
-        return_exceptions=True,
-    )
+    # ─── Per-planet collection (параллельно для каждой планеты) ──────────────
+    async def _collect_planet(name_en: str) -> tuple[str, dict]:
+        enum = planet_enums.get(name_en)
+        if enum is None:
+            return name_en, {}
+        # Параллельно собираем всё про эту планету
+        (lon_raw, retro_raw, nak_raw, exalt_raw, debil_raw, own_raw,
+         friend_raw, enemy_raw, combust_raw, vargot_raw,
+         d9_raw, d10_raw, avastha_raw, shadbala_raw, strength_raw) = await asyncio.gather(
+            _safe(fn_lon,      enum, birth_time_obj),
+            _safe(fn_retro,    enum, birth_time_obj),
+            _safe(fn_nak,      enum, birth_time_obj),
+            _safe(fn_exalt,    enum, birth_time_obj, default=False),
+            _safe(fn_debil,    enum, birth_time_obj, default=False),
+            _safe(fn_own,      enum, birth_time_obj, default=False),
+            _safe(fn_friend,   enum, birth_time_obj, default=False),
+            _safe(fn_enemy,    enum, birth_time_obj, default=False),
+            _safe(fn_combust,  enum, birth_time_obj, default=False),
+            _safe(fn_vargot,   enum, birth_time_obj, default=False),
+            _safe(fn_d9,       enum, birth_time_obj),
+            _safe(fn_d10,      enum, birth_time_obj),
+            _safe(fn_avastha,  enum, birth_time_obj),
+            _safe(fn_shadbala, enum, birth_time_obj),
+            _safe(fn_strength, enum, birth_time_obj),
+        )
 
-    result: dict[str, Any] = {}
-    for key, value in zip(_METRIC_KEYS, raw_results):
-        if isinstance(value, BaseException):
-            logger.warning("VedAstro call %r unexpected error: %s", key, value)
-            result[key] = None
+        lon = _to_float(lon_raw) if lon_raw is not None else None
+        sign_ru = _sign_from_longitude_ru(lon) if lon is not None else ""
+        degree = round(lon % 30, 2) if lon is not None else 0.0
+
+        # Дигнити: приоритет экзальт→падение→своя→друг→враг→нейтрал
+        if bool(exalt_raw):
+            dignity = "экзальтация"
+        elif bool(debil_raw):
+            dignity = "падение"
+        elif bool(own_raw):
+            dignity = "своя обитель"
+        elif bool(friend_raw):
+            dignity = "знак друга"
+        elif bool(enemy_raw):
+            dignity = "знак врага"
         else:
-            result[key] = value
-    return result
+            dignity = "нейтральный знак"
+
+        nakshatra_str = _to_str(nak_raw) if nak_raw is not None else ""
+
+        # D9 / D10 — берём от vedastro если ответил, иначе вычисляем математически
+        d9_sign = _parse_sign(d9_raw) if d9_raw is not None else ""
+        if not d9_sign:
+            d9_sign = _navamsha_from_longitude_ru(lon)
+        d10_sign = _parse_sign(d10_raw) if d10_raw is not None else ""
+        if not d10_sign:
+            d10_sign = _d10_from_longitude_ru(lon)
+
+        avastha_str = _to_str(avastha_raw) if avastha_raw is not None else ""
+        shad_val = _to_float(shadbala_raw) if shadbala_raw is not None else None
+        if shad_val is None and strength_raw is not None:
+            shad_val = _to_float(strength_raw)
+
+        return name_en, {
+            "sign":          sign_ru,
+            "degree":        degree,
+            "nakshatra":     nakshatra_str,
+            "pada":          0,
+            "retro":         bool(retro_raw),
+            "combust":       bool(combust_raw),
+            "vargottama":    bool(vargot_raw),
+            "dignity":       dignity,
+            "dispositor":    SIGN_RULERS.get(sign_ru, ""),
+            "navamsha_sign": d9_sign,
+            "d10_sign":      d10_sign,
+            "avastha":       avastha_str,
+            "shadbala":      round(shad_val, 1) if shad_val is not None else None,
+            "lon_full":      lon,
+            "house":         0,  # заполнится после получения Лагны
+        }
+
+    planet_pairs = await asyncio.gather(*[_collect_planet(n) for n in PLANET_NAMES_EN])
+    planets: dict[str, dict] = dict(planet_pairs)
+
+    # ─── Lagna (House1) ──────────────────────────────────────────────────────
+    fn_house_sign = getattr(Calculate, "HouseSignName", None) or getattr(Calculate, "HouseRasiSign", None)
+    fn_house_const = getattr(Calculate, "HouseConstellation", None)
+    h1_enum = getattr(HouseName, "House1", None) if HouseName else None
+
+    lagna_sign_ru = ""
+    lagna_nak = ""
+    if fn_house_sign and h1_enum is not None:
+        sign_raw = await _safe(fn_house_sign, h1_enum, birth_time_obj)
+        lagna_sign_ru = _parse_sign(sign_raw) if sign_raw is not None else ""
+    if fn_house_const and h1_enum is not None:
+        nak_raw = await _safe(fn_house_const, h1_enum, birth_time_obj)
+        lagna_nak = _to_str(nak_raw) if nak_raw is not None else ""
+
+    lagna = {"sign": lagna_sign_ru, "degree": 0.0, "nakshatra": lagna_nak}
+
+    # ─── Раставляем планетам номера домов от Лагны (whole-sign) ──────────────
+    if lagna_sign_ru:
+        for name_en, p in planets.items():
+            if p.get("sign"):
+                p["house"] = _house_from_lagna(p["sign"], lagna_sign_ru)
+
+    # ─── Dasha (chart-level, takes just time) ────────────────────────────────
+    fn_dasha = (getattr(Calculate, "DasaForNow", None)
+                or getattr(Calculate, "DasaAtTime", None))
+    dasha_raw = await _safe(fn_dasha, birth_time_obj) if fn_dasha else None
+    dasha = parse_dasha(dasha_raw) if dasha_raw is not None else {"maha": "", "antar": "", "until": ""}
+
+    # ─── Navamsha (D9) sign map ──────────────────────────────────────────────
+    navamsha = {name: p.get("navamsha_sign", "") for name, p in planets.items()
+                if p.get("navamsha_sign")}
+
+    # ─── Shadbala / Avastha maps ─────────────────────────────────────────────
+    shadbala = {name: p["shadbala"] for name, p in planets.items()
+                if p.get("shadbala") is not None}
+    avastha = {name: p["avastha"] for name, p in planets.items()
+               if p.get("avastha")}
+
+    # ─── Aspects (per-planet through PlanetsAspectingPlanet) ─────────────────
+    aspects: list[dict] = []
+    fn_aspect = getattr(Calculate, "PlanetsAspectingPlanet", None)
+    if fn_aspect:
+        async def _planet_aspects(target_en: str) -> list[dict]:
+            target_enum = planet_enums.get(target_en)
+            if target_enum is None:
+                return []
+            raw = await _safe(fn_aspect, target_enum, birth_time_obj)
+            if raw is None:
+                return []
+            out = []
+            for item in _iter_safe(raw):
+                src_en = _to_str(item)
+                if src_en in PLANET_NAMES_EN:
+                    out.append({
+                        "from": PLANET_NAMES_RU.get(src_en, src_en),
+                        "to":   PLANET_NAMES_RU.get(target_en, target_en),
+                        "kind": ASPECT_KINDS.get((src_en, target_en), ""),
+                    })
+            return out
+
+        aspect_lists = await asyncio.gather(*[_planet_aspects(n) for n in PLANET_NAMES_EN])
+        for lst in aspect_lists:
+            aspects.extend(lst)
+
+    # ─── Sade Sati: попробуем разные методы, fallback "не идёт" ──────────────
+    sade_sati = "не идёт"
+    fn_sade = (getattr(Calculate, "IsPlanetGocharaBindu", None)
+               or getattr(Calculate, "SadeSatiSummary", None))
+    if fn_sade:
+        try:
+            res = await va(fn_sade, birth_time_obj)
+            if res:
+                sade_sati = _to_str(res) or "не идёт"
+        except Exception:
+            pass
+
+    # ─── Yogas: пока не реализованы (vedastro нет bulk-метода). Передадим пустой список.
+    yogas: list[str] = []
+
+    return {
+        "planets":   planets,
+        "lagna":     lagna,
+        "navamsha":  navamsha,
+        "dasha":     dasha,
+        "shadbala":  shadbala,
+        "avastha":   avastha,
+        "aspects":   aspects,
+        "yogas":     yogas,
+        "sade_sati": sade_sati,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -615,45 +849,24 @@ async def build_astro_data(
         birth_date, birth_time_str, tz_str, lat, lon, city_name,
     )
 
-    # Parallel collection — one HTTP call per thread
-    raw_results = await collect_all_metrics(birth_time_obj)
-
-    # Parse each metric
-    planets  = parse_planets(raw_results["all_planets"])
-    lagna    = parse_lagna(raw_results["all_planets"])
-
-    # Fallback: some VedAstro versions expose lagna via a separate call
-    if not lagna["sign"]:
-        try:
-            lagna_sign_raw = await va(Calculate.LagnaSign, birth_time_obj)  # [verify]
-            lagna["sign"] = _parse_sign(lagna_sign_raw)
-        except Exception as exc:
-            logger.warning("LagnaSign fallback failed: %s", exc)
-
-    navamsha  = parse_navamsha(raw_results["navamsha"])
-    dasha     = parse_dasha(raw_results["dasha"])
-    shadbala  = parse_shadbala(raw_results["shadbala"])
-    avastha   = parse_avastha(raw_results["avastha"])
-    aspects   = parse_aspects(raw_results["aspects"])
-    sade_sati = parse_sade_sati(raw_results["sade_sati"])
-
-    yogas_raw = raw_results.get("yogas") or []
-    yogas = [_to_str(y) for y in _iter_safe(yogas_raw) if _to_str(y)]
+    # Параллельный сбор + parsing внутри collect_all_metrics — возвращает уже
+    # готовые структуры (не сырые VedAstro объекты)
+    data = await collect_all_metrics(birth_time_obj)
 
     return {
         "raw": {
-            "planets":   planets,
-            "ascendant": lagna,
-            "navamsha":  navamsha,
+            "planets":   data["planets"],
+            "ascendant": data["lagna"],
+            "navamsha":  data["navamsha"],
             "dashamsha": {},   # populated lazily when dashamsha section is opened
-            "dasha":     dasha,
-            "yogas":     yogas,
-            "sade_sati": sade_sati,
+            "dasha":     data["dasha"],
+            "yogas":     data["yogas"],
+            "sade_sati": data["sade_sati"],
         },
         "metrics": {
-            "shadbala": shadbala,
-            "avastha":  avastha,
-            "aspects":  aspects,
+            "shadbala": data["shadbala"],
+            "avastha":  data["avastha"],
+            "aspects":  data["aspects"],
         },
         # Filled in by FeatureExtractor right after this call
         "features": {
