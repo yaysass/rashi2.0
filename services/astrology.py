@@ -12,6 +12,7 @@ PHASE 1 NOTE:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 from datetime import datetime
 from typing import Any
@@ -24,6 +25,15 @@ from timezonefinder import TimezoneFinder
 from config import VEDASTRO_API_KEY
 
 logger = logging.getLogger(__name__)
+
+# Выделенный однопоточный executor для всех вызовов VedAstro.
+# VedAstro Python-биндинги не являются thread-safe: параллельные вызовы из
+# разных системных потоков перезаписывают внутреннее состояние библиотеки и
+# возвращают одинаковые (неверные) результаты для разных планет.
+# Запуск ВСЕХ вызовов на одном выделенном потоке исключает race condition.
+_VA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="vedastro"
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  VedAstro bootstrap
@@ -349,8 +359,13 @@ def _va_call(fn, *args):
 
 
 async def va(fn, *args) -> Any:
-    """Run any synchronous VedAstro call in a thread pool."""
-    return await asyncio.to_thread(_va_call, fn, *args)
+    """
+    Запустить синхронный вызов VedAstro на выделенном однопоточном executor.
+    Все вызовы гарантированно выполняются последовательно на одном потоке —
+    это критично для корректной работы VedAstro Python-биндингов.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_VA_EXECUTOR, _va_call, fn, *args)
 
 
 def _make_birth_time_sync(
@@ -520,8 +535,23 @@ async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
             "house":         0,  # заполнится после получения Лагны
         }
 
-    planet_pairs = await asyncio.gather(*[_collect_planet(n) for n in PLANET_NAMES_EN])
-    planets: dict[str, dict] = dict(planet_pairs)
+    # ─── Per-planet collection (ПОСЛЕДОВАТЕЛЬНО, не параллельно!) ────────────
+    # asyncio.gather по 9 планетам × 15 методов = 135 параллельных потоков →
+    # race condition в VedAstro (все планеты возвращают одну долготу).
+    # Однопоточный executor + последовательный обход планет исключают проблему.
+    planets: dict[str, dict] = {}
+    for name_en in PLANET_NAMES_EN:
+        _, planet_data = await _collect_planet(name_en)
+        planets[name_en] = planet_data
+        # Диагностика: видно в Railway logs после деплоя — проверить разнообразие
+        logger.info(
+            "[LON] %-8s lon=%-7s sign=%-12s house=%s retro=%s",
+            name_en,
+            f"{planet_data.get('lon_full'):.1f}" if planet_data.get("lon_full") is not None else "None",
+            planet_data.get("sign", ""),
+            planet_data.get("house", 0),
+            planet_data.get("retro"),
+        )
 
     # ─── Lagna (House1) ──────────────────────────────────────────────────────
     fn_house_sign = getattr(Calculate, "HouseSignName", None) or getattr(Calculate, "HouseRasiSign", None)
