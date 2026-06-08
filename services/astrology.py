@@ -27,6 +27,71 @@ from config import VEDASTRO_API_KEY
 
 logger = logging.getLogger(__name__)
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Geocoding (импортируется handlers/settings.py — обязателен для онбординга)
+# ──────────────────────────────────────────────────────────────────────────────
+_geolocator = Nominatim(user_agent="rashi_bot_v2", timeout=10)
+_tf = TimezoneFinder()
+
+
+def _geocode_sync(city: str) -> tuple[float, float, str, str]:
+    """Sync geocode. Returns (lat, lon, short_name, tz_str)."""
+    try:
+        loc = _geolocator.geocode(city, language="ru", addressdetails=True)
+    except (GeocoderTimedOut, GeocoderUnavailable) as exc:
+        raise RuntimeError(f"Geocoder unavailable: {exc}") from exc
+    if loc is None:
+        raise ValueError(f"Город не найден: {city!r}")
+    lat, lon = loc.latitude, loc.longitude
+    tz_str = _tf.timezone_at(lat=lat, lng=lon) or "UTC"
+    addr = loc.raw.get("address", {})
+    short_name = (
+        addr.get("city")
+        or addr.get("town")
+        or addr.get("village")
+        or loc.address.split(",")[0].strip()
+    )
+    return lat, lon, short_name, tz_str
+
+
+async def geocode_city(city: str) -> tuple[float, float, str, str]:
+    """Async geocode: city name → (lat, lon, short_name, tz_str)."""
+    return await asyncio.to_thread(_geocode_sync, city)
+
+
+def _tz_offset_str(tz_name: str) -> str:
+    """±HH:MM UTC offset для tz, с учётом DST."""
+    try:
+        tz = pytz.timezone(tz_name)
+        now = datetime.now(tz)
+        offset = now.utcoffset()
+        total_sec = int(offset.total_seconds())  # type: ignore[union-attr]
+        sign = "+" if total_sec >= 0 else "-"
+        h, m = divmod(abs(total_sec) // 60, 60)
+        return f"{sign}{h:02d}:{m:02d}"
+    except Exception:
+        return "+00:00"
+
+
+def _make_birth_time_sync(
+    birth_date: str,      # ДД.ММ.ГГГГ
+    birth_time_str: str,  # ЧЧ:ММ
+    tz_str: str,
+    lat: float,
+    lon: float,
+    city_name: str,
+) -> Any:
+    """Build a VedAstro Time object. Must run in a thread."""
+    if not _VA_AVAILABLE:
+        raise RuntimeError("vedastro library not installed")
+    day, month, year = birth_date.split(".")
+    offset = _tz_offset_str(tz_str)
+    time_str = f"{birth_time_str} {day}/{month}/{year} {offset}"
+    geo = GeoLocation(city_name, lon, lat)
+    return Time(time_str, geo)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 #  VedAstro bootstrap
 # ──────────────────────────────────────────────────────────────────────────────
