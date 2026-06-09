@@ -184,7 +184,8 @@ _HOUSE_PLANET_CANDIDATES: list[str] = [
 _CAND: dict[str, list[str]] = {
     "PlanetSign":  ["PlanetZodiacSign", "PlanetRasiName", "PlanetSignName",
                     "PlanetSign", "PlanetSignNiryana", "PlanetSignNirayana",
-                    "PlanetRasi", "PlanetRasiNirayana"],
+                    "PlanetRasi", "PlanetRasiNirayana", "PlanetRasiD1Sign",
+                    "PlanetInSign"],
     "PlanetLon":   ["PlanetNirayanaLongitude", "PlanetSayanaLongitude",
                     "PlanetLongitude", "PlanetTropicalLongitude"],
     "PlanetConst": ["PlanetConstellation", "PlanetNakshatra",
@@ -203,6 +204,7 @@ _CAND: dict[str, list[str]] = {
 }
 
 _METHODS: dict[str, Any] = {}
+_DIAG_LOGGED: bool = False
 
 
 def _resolve_method(*names: str) -> Any | None:
@@ -607,6 +609,70 @@ async def collect_all_metrics(birth_time_obj: Any) -> dict[str, Any]:
         }
 
     _resolve_all_methods()
+
+    # ─── Встроенная диагностика: одна на сессию ─────────────────────────────
+    # Логгирует что vedastro возвращает для Sun vs Mars в обоих порядках для
+    # КАЖДОГО метода-знака. По логам видно: какой метод даёт ДИФФЕРЕНЦИРОВАННУЮ
+    # информацию для разных планет и в каком порядке аргументов.
+    global _DIAG_LOGGED
+    if not _DIAG_LOGGED:
+        _DIAG_LOGGED = True
+        sun_enum = getattr(PlanetName, "Sun", None) if PlanetName else None
+        mars_enum = getattr(PlanetName, "Mars", None) if PlanetName else None
+        logger.info("[DIAGVA] === START vedastro diagnostic ===")
+        logger.info("[DIAGVA] Sun enum: %r", sun_enum)
+        logger.info("[DIAGVA] Mars enum: %r", mars_enum)
+        logger.info("[DIAGVA] Sun == Mars: %s", sun_enum == mars_enum)
+        # Все методы для разбивки данных по планетам
+        for method_name in [
+            "PlanetNirayanaLongitude",
+            "PlanetSayanaLongitude",
+            "PlanetZodiacSign",
+            "PlanetRasiName",
+            "PlanetRasiD1Sign",
+            "PlanetRasiNirayana",
+            "PlanetSign",
+            "PlanetSignName",
+            "PlanetInSign",
+        ]:
+            fn = getattr(Calculate, method_name, None)
+            if fn is None:
+                logger.info("[DIAGVA] %s: НЕ существует", method_name)
+                continue
+            # Sun + (planet, time)
+            try:
+                r_sun_pt = await va(fn, sun_enum, birth_time_obj)
+                r_sun_pt_str = _to_str(r_sun_pt)[:30]
+            except Exception as exc:
+                r_sun_pt_str = f"ERR({str(exc)[:25]})"
+            # Mars + (planet, time)
+            try:
+                r_mars_pt = await va(fn, mars_enum, birth_time_obj)
+                r_mars_pt_str = _to_str(r_mars_pt)[:30]
+            except Exception as exc:
+                r_mars_pt_str = f"ERR({str(exc)[:25]})"
+            # Sun + (time, planet)
+            try:
+                r_sun_tp = await va(fn, birth_time_obj, sun_enum)
+                r_sun_tp_str = _to_str(r_sun_tp)[:30]
+            except Exception as exc:
+                r_sun_tp_str = f"ERR({str(exc)[:25]})"
+            # Mars + (time, planet)
+            try:
+                r_mars_tp = await va(fn, birth_time_obj, mars_enum)
+                r_mars_tp_str = _to_str(r_mars_tp)[:30]
+            except Exception as exc:
+                r_mars_tp_str = f"ERR({str(exc)[:25]})"
+            # Различия — главное что нам нужно знать
+            diff_pt = r_sun_pt_str != r_mars_pt_str
+            diff_tp = r_sun_tp_str != r_mars_tp_str
+            logger.info(
+                "[DIAGVA] %s | (p,t): Sun=%-20s Mars=%-20s diff=%s | (t,p): Sun=%-20s Mars=%-20s diff=%s",
+                method_name, r_sun_pt_str, r_mars_pt_str, diff_pt,
+                r_sun_tp_str, r_mars_tp_str, diff_tp,
+            )
+        logger.info("[DIAGVA] === END vedastro diagnostic ===")
+    # ────────────────────────────────────────────────────────────────────────
 
     # Подготовим список планет с их enum-значениями
     planet_list: list[tuple[str, Any]] = []
