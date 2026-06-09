@@ -36,7 +36,7 @@ from telegram.ext import (
 
 from config import TELEGRAM_TOKEN
 from db.models import init_db
-from handlers import menu, payments, premium, questions, settings, specials
+from handlers import debug, menu, payments, premium, questions, settings, specials
 from handlers.onboarding import build_onboarding_handler, cmd_start
 from keyboards.keyboards import main_menu
 from scheduler.jobs import setup_scheduler
@@ -163,6 +163,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_menu))
     app.add_handler(CommandHandler("help",  cmd_help))
+    app.add_handler(CommandHandler("diagva", debug.cmd_diagva))  # админская диагностика vedastro
 
     # ── Онбординг ─────────────────────────────────────────────────────────────
     app.add_handler(build_onboarding_handler())
