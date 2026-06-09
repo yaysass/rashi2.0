@@ -183,7 +183,8 @@ _HOUSE_PLANET_CANDIDATES: list[str] = [
 
 _CAND: dict[str, list[str]] = {
     "PlanetSign":  ["PlanetZodiacSign", "PlanetRasiName", "PlanetSignName",
-                    "PlanetRasiD1Sign", "PlanetSign", "PlanetInSign"],
+                    "PlanetSign", "PlanetSignNiryana", "PlanetSignNirayana",
+                    "PlanetRasi", "PlanetRasiNirayana"],
     "PlanetLon":   ["PlanetNirayanaLongitude", "PlanetSayanaLongitude",
                     "PlanetLongitude", "PlanetTropicalLongitude"],
     "PlanetConst": ["PlanetConstellation", "PlanetNakshatra",
